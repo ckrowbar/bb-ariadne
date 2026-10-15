@@ -77,9 +77,37 @@ It gives:
 
 Fallback when a task has no repo: a personal workspace.
 
-To verify before building: whether a worker can rename its managed-worktree
-branch to the `cyrus.kalafchi/CHATINTS-XXXX/<slug>` convention, and whether
-PR detection works after that rename.
+Workers spawn with `permissionMode: "full"`, matching how the user's earlier
+autonomous ticket threads ran. Under the default sandbox, a test worker
+stalled on "Allow network connection to 127.0.0.1?" after a plain `git`
+command.
+
+### Worktree test findings (2026-10-15)
+
+dd-source is registered as BB project `proj_jqj7vvv6ad`.
+
+- **Base refresh is the blocker.** With the default base or
+  `--base-branch origin/main`, BB first runs
+  `git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main`. That
+  uses SSH, and SSH only works while the user's laptop forwards its agent, so
+  provisioning failed. A local base (`--base-branch main`) skips the fetch, but
+  local `main` was 24 hours old.
+  - Plan: before each spawn, the plugin refreshes `origin/main` over
+    token-authenticated HTTPS (the same path the workspace commit helper uses)
+    and passes the resulting commit as the base. To verify: that BB accepts a
+    commit SHA as the base without fetching.
+- **Branch names.** BB names the branch `bb/<title-slug>-<thread-id>`. A worker
+  can `git branch -m` to the user's convention; BB shows the new name after its
+  next status refresh.
+- **PR detection works**, including checks: "#123379 draft ... Checks: pending
+  (10 passed, 0 failed, 1 pending, 11 total)". BB's GitHub access does not
+  need SSH.
+- **Cost.** Checking out dd-source took 51 s. Teardown took about 2 min.
+- **Teardown leaves local branches.** The plugin deletes a worker's local
+  branch after teardown only if the branch matches its upstream.
+- **Questions are clickable.** Claude Code's question tool became a
+  `question` interaction with options. A question asked while another
+  interaction is pending fails, so the worker has to ask again.
 
 ## Data model (plugin SQLite)
 
@@ -157,7 +185,7 @@ open threads through BB navigation.
 | Talk to Cyril, hand it a ticket | The pinned Cyril thread. Plain chat |
 | See what is going on | **Cyril** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
 | Same, without leaving the chat | **Board** thread panel on the Cyril thread, same rows beside the conversation |
-| Answer an escalation | Cyril asks with the provider's native question UI so answers are clicks. The SDK says a provider with `supportsNativeUserQuestion` has its questions routed "into the pending-interaction path"; to verify for Claude Code before building. Free-form questions are ordinary chat |
+| Answer an escalation | Cyril asks with the provider's native question UI so answers are clicks. Verified for Claude Code in the worktree test. Free-form questions are ordinary chat |
 | Unstick a worker waiting on approval | Cyril's alert links the worker thread. BB's native approve or deny controls are there |
 | Check what Cyril knows | **Notes** tab: read-only topics with revision history |
 | See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
