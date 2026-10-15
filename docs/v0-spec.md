@@ -218,7 +218,7 @@ problem is clearly its own. There are two paths:
 
 Verified 2026-10-15: lesson 1 (Haiku for throwaway tasks) was followed on the
 next spawn, and an improvement request produced
-[ckrowbar/bb-cyril#1](https://github.com/ckrowbar/bb-cyril/pull/1).
+[ckrowbar/bb-ariadne#1](https://github.com/ckrowbar/bb-ariadne/pull/1).
 
 ## UI
 

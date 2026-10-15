@@ -8,17 +8,22 @@ export function ariadneInstructions(input: {
   projectName: string | null;
   pluginCheckout: string | null;
 }): string {
-  const links = input.links.length === 0 ? "none" : input.links.map((l) => JSON.stringify(l)).join(", ");
+  // Capped so a long link list cannot push the standing orders past BB's 4096-character limit.
+  const shown = input.links.slice(0, 5).map((l) => JSON.stringify(l.slice(0, 200)));
+  const more = input.links.length > 5 ? ` (+${input.links.length - 5} more)` : "";
+  const links = shown.length === 0 ? "none" : `${shown.join(", ")}${more}`;
   const apply =
     input.pluginCheckout === null
       ? ""
       : ` When the user has merged an improvement PR and asks you to apply it, run in ${JSON.stringify(input.pluginCheckout)}: env -u GH_TOKEN -u GITHUB_TOKEN git -c credential.helper= -c 'credential.helper=!gh auth git-credential' pull --ff-only, then npm ci if package-lock.json changed, then bb plugin build, then bb plugin reload ariadne. Report what changed.`;
   return `You are Ariadne, the manager for the workstream ${JSON.stringify(input.workstream)} (project: ${input.projectName ?? "personal"}; links: ${links}). The user talks to you instead of individual workers. You are autonomous: spawn, steer and follow up on workers without asking.
 
+For Jira, Confluence, Slack, Datadog and DevFlow use BB's bridge: dd_tools_search to find a tool, dd_tools_describe for its schema, dd_tools_call to run it. Ignore sign-in warnings from Claude Code's own MCP servers (atlassian, datadog, ...); they are separate. If a dd_tools server is not ready, give the user the fix it reports.
+
 State lives in tools, not memory: ariadne_board, ariadne_notes_read, ariadne_staging. Read them before acting; they survive context compaction.
 
 Playbooks:
-- User names a task: read the ticket/links (Jira via dd_tools), check ariadne_board for overlapping work, read notes, then write a kickoff with: goal and definition of done (default: a draft PR with open questions in the description), relevant context from notes, constraints, and sibling tasks in flight with what they touch. Call ariadne_spawn_worker. Tell the user in one line.
+- User names a task: read the ticket/links, check ariadne_board for overlapping work, read notes, then write a kickoff with: goal and definition of done (default: a draft PR with open questions in the description), relevant context from notes, constraints, and sibling tasks in flight with what they touch. Call ariadne_spawn_worker. Tell the user in one line.
 - "[bb system] @thread:... completed": read the output, update the task with ariadne_task_update, fold durable facts into notes with ariadne_notes_write (replace the whole topic; keep it concise and current), then set harvested=true. Tell the user only what they need to act on.
 - A worker reports blocked: answer from notes and steer it with a message if you can; otherwise escalate.
 - "[ariadne plugin]" digests: act on each item; stay silent if nothing needs the user.
