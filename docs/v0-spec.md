@@ -10,7 +10,8 @@ tracks what each worker is doing, including what it has put on staging. Cyril
 is autonomous: it spawns and steers without asking, and escalates only on the
 cases listed below.
 
-v0 is backend-only. No UI.
+Every key human interaction is a click in the BB app. The CLI exists for
+agents and scripting, not as the user's interface.
 
 ## Concepts
 
@@ -144,7 +145,36 @@ It sends Cyril one digest only when something changed. It ticks every 10
 minutes while there is activity and stops after 60 minutes with no changes.
 Any spawn, worker report or worker lifecycle event restarts it.
 
+## UI
+
+v0 uses stable plugin slots only (`app.slots.navPanel`,
+`app.slots.threadPanelAction`, `app.slots.homepageSection`). Thread links
+open threads through BB navigation.
+
+| Human interaction | Where you click |
+| --- | --- |
+| Start a workstream | **Cyril** sidebar page → **New workstream** (name, optional links). Creates a pinned Cyril thread and opens it |
+| Talk to Cyril, hand it a ticket | The pinned Cyril thread. Plain chat |
+| See what is going on | **Cyril** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
+| Same, without leaving the chat | **Board** thread panel on the Cyril thread, same rows beside the conversation |
+| Answer an escalation | Cyril asks with the provider's native question UI so answers are clicks. The SDK says a provider with `supportsNativeUserQuestion` has its questions routed "into the pending-interaction path"; to verify for Claude Code before building. Free-form questions are ordinary chat |
+| Unstick a worker waiting on approval | Cyril's alert links the worker thread. BB's native approve or deny controls are there |
+| Check what Cyril knows | **Notes** tab: read-only topics with revision history |
+| See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
+| Drop a task | **Drop** on the board row. Archives the worker thread and marks the task `dropped` |
+| Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
+| Retire a workstream | **Archive** on the workstream page. Archives the Cyril thread and its workers |
+
+Data reaches the UI through plugin RPC, and a realtime signal refreshes open
+views when the board, notes or staging log change.
+
+Later, if useful: a status chip in the Cyril thread header
+(`experimental_threadHeaderAction`) and `#task` mentions in the composer
+(`bb.ui.registerMentionProvider`).
+
 ## CLI
+
+For agents and scripting.
 
 ```
 bb cyril create <workstream> [--project <id>] [--link <url>]...
@@ -156,7 +186,7 @@ bb cyril staging [--limit <n>]
 
 ## Out of scope for v0
 
-- UI (board panel). Revisit after a few weeks of use.
+- Editing notes in the UI. Notes are machine-maintained; the UI is read-only.
 - Enforcing anything through the `message.dispatch` hook. It is experimental.
 - Multi-machine correctness. The plugin assumes the server and workers share
   a host.
