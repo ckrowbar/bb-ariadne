@@ -8,6 +8,7 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { PluginCliError, cliCommand, defineCli } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { boardRow } from "./src/board";
 import { CHANGED_CHANNEL, TASK_STATUSES, rpcContract, type PrSummary, type Task, type Workstream } from "./src/contract";
 import { openStore, type WorkstreamRow } from "./src/db";
 import {
@@ -366,6 +367,29 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
+  /** The branch checked out in a worktree, which follows `git branch -m` renames. */
+  async function worktreeBranch(env: Awaited<ReturnType<typeof bb.sdk.environments.get>>): Promise<string | null> {
+    return env.path === null ? env.branchName : ((await currentBranch(env.path)) ?? env.branchName);
+  }
+
+  /**
+   * Records the task's current branch. The heartbeat only covers active
+   * tasks, so without this a task that finishes between heartbeats keeps a
+   * stale or empty branch.
+   */
+  async function refreshBranch(task: Task): Promise<void> {
+    try {
+      const environmentId = await environmentIdFor(task);
+      if (environmentId === null) return;
+      const env = await bb.sdk.environments.get({ environmentId });
+      if (env.lifecycle.phase === "destroyed") return;
+      const branch = await worktreeBranch(env);
+      if (branch !== null) store.updateTask(task.id, { branch });
+    } catch (error) {
+      bb.log.warn(`branch refresh ${task.id} failed: ${String(error)}`);
+    }
+  }
+
   /** Refreshes PR state for tasks with a worktree. Returns digest lines for changes. */
   async function refreshPullRequests(tasks: Task[]): Promise<Map<string, string[]>> {
     const lines = new Map<string, string[]>();
@@ -376,8 +400,7 @@ export default async function plugin(bb: BbPluginApi) {
         const env = await bb.sdk.environments.get({ environmentId });
         if (env.lifecycle.phase === "destroyed") continue;
         const pr = prSummary(await bb.sdk.environments.pullRequest({ environmentId }));
-        const branch = env.path === null ? env.branchName : ((await currentBranch(env.path)) ?? env.branchName);
-        store.updateTask(task.id, { pr, prUrl: pr?.url ?? task.prUrl, branch });
+        store.updateTask(task.id, { pr, prUrl: pr?.url ?? task.prUrl, branch: await worktreeBranch(env) });
         if (pr === null) continue;
         const signature = `${pr.state}|${pr.attention}|${pr.checks.state}`;
         if (store.digestChanged(`pr:${task.id}`, signature) && (pr.checks.state === "failing" || pr.attention !== "none")) {
@@ -524,12 +547,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (typeof ws === "string") return errorText(ws);
       const tasks = store.tasks(ws.name, status);
       if (tasks.length === 0) return "No tasks.";
-      return tasks
-        .map((t) => {
-          const pr = t.pr === null ? (t.prUrl ?? "no PR") : `PR #${t.pr.number} ${t.pr.state}, checks ${t.pr.checks.state}`;
-          return `${t.id} [${t.status}${t.harvested ? ", harvested" : ""}] ${t.title} | worker @thread:${t.workerThreadId} | ${t.branch ?? "-"} | ${pr}${t.summary ? ` | ${t.summary}` : ""}`;
-        })
-        .join("\n");
+      return tasks.map((t) => boardRow(t, true)).join("\n");
     },
   });
 
@@ -682,6 +700,7 @@ export default async function plugin(bb: BbPluginApi) {
         prUrl: prUrl ?? undefined,
         summary: status === "done" ? note.slice(0, 2000) : undefined,
       });
+      await refreshBranch(task);
       store.event(`report-${status}`, note, task.workstream, task.id);
       markActivity();
       publish();
@@ -707,6 +726,7 @@ export default async function plugin(bb: BbPluginApi) {
       const task = store.taskByWorker(threadId);
       if (task === undefined) return errorText("This thread is not a Cyril worker.");
       store.logStaging({ workstream: task.workstream, workerThreadId: threadId, taskId: task.id, service, branch, purpose });
+      store.updateTask(task.id, { branch });
       store.event("staging", `${service} ${branch}`, task.workstream, task.id);
       markActivity();
       publish();
@@ -845,9 +865,7 @@ export default async function plugin(bb: BbPluginApi) {
           positionals: [{ name: "workstream", description: "Workstream name", required: true }],
           async run(input) {
             const tasks = store.tasks(input.positionals.workstream);
-            const lines = tasks.map(
-              (t) => `${t.id}  [${t.status}]  ${t.title}  worker=${t.workerThreadId ?? "-"}  ${t.pr?.url ?? t.prUrl ?? ""}`,
-            );
+            const lines = tasks.map((t) => boardRow(t, false));
             return { exitCode: 0, stdout: lines.length === 0 ? "No tasks." : lines.join("\n") };
           },
         }),

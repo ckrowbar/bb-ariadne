@@ -98,7 +98,10 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
     commit SHA as the base without fetching.
 - **Branch names.** BB names the branch `bb/<title-slug>-<thread-id>`. A worker
   can `git branch -m` to the user's convention; BB shows the new name after its
-  next status refresh.
+  next status refresh. The plugin records the worktree's current branch on
+  each heartbeat (active tasks only), on every `cyril_report`, and from the
+  `branch` argument of `cyril_staging_log`, so a rename shows up even if the
+  task finishes between heartbeats.
 - **PR detection works**, including checks: "#123379 draft ... Checks: pending
   (10 passed, 0 failed, 1 pending, 11 total)". BB's GitHub access does not
   need SSH.
@@ -137,7 +140,7 @@ the spike).
 | Tool | Does |
 | --- | --- |
 | `cyril_spawn_worker(title, prompt, links?, model?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
-| `cyril_board(status?)` | Lists this workstream's tasks, with PR state where known |
+| `cyril_board(status?)` | Lists this workstream's tasks: status, harvested, worker, branch, PR and checks state, summary. `bb cyril board` prints the same row |
 | `cyril_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
 | `cyril_notes_read(topic?)` / `cyril_notes_write(topic, body)` | Reads or replaces a note topic |
 | `cyril_staging(limit?)` | Lists recent staging log entries across all workstreams |
@@ -207,7 +210,7 @@ For agents and scripting.
 ```
 bb cyril create <workstream> [--project <id>] [--link <url>]...
 bb cyril list                      # workstreams and their Cyril threads
-bb cyril board <workstream>
+bb cyril board <workstream>        # same rows as cyril_board
 bb cyril notes <workstream> [topic]
 bb cyril staging [--limit <n>]
 ```
