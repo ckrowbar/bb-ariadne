@@ -122,6 +122,15 @@ export async function refreshBase(repoPath: string, remoteUrl: string | null, br
   return { sha, fresh: warning === null, warning };
 }
 
+/** The checkout's origin URL. BB records a project's remote once, so it goes stale after a repo rename. */
+export async function originUrl(repoPath: string): Promise<string | null> {
+  try {
+    return await git(repoPath, ["remote", "get-url", "origin"]);
+  } catch {
+    return null;
+  }
+}
+
 export async function defaultBranch(repoPath: string): Promise<string> {
   try {
     const ref = await git(repoPath, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);

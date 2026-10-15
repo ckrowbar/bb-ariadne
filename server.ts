@@ -17,6 +17,7 @@ import {
   currentBranch,
   defaultBranch,
   deleteBranch,
+  originUrl,
   parseGitHubRemote,
   refreshBase,
   worktreeDirt,
@@ -164,7 +165,7 @@ export default async function plugin(bb: BbPluginApi) {
     return {
       name: project.name,
       kind: project.kind,
-      remoteUrl: project.gitRemoteUrl,
+      remoteUrl: (source?.path ? await originUrl(source.path) : null) ?? project.gitRemoteUrl,
       path: source?.path ?? null,
       hostId: source?.hostId ?? null,
     };
