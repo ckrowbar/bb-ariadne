@@ -1,9 +1,9 @@
-// bb-plugin-cyril — frontend entry.
+// bb-plugin-ariadne — frontend entry.
 //
 // Every key human interaction is a click here (docs/v0-spec.md, UI):
-// - Cyril sidebar page: workstreams, New workstream, and per workstream the
+// - Ariadne sidebar page: workstreams, New workstream, and per workstream the
 //   Board, Notes and Staging tabs.
-// - "Cyril board" thread panel: the same board beside a Cyril or worker chat.
+// - "Ariadne board" thread panel: the same board beside a Ariadne or worker chat.
 // - Home page section: each active workstream with task counts.
 // Data comes over plugin RPC; the server's realtime signal refreshes views.
 import { useCallback, useEffect, useState } from "react";
@@ -32,7 +32,7 @@ import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
-const PANEL_PATH = "cyril";
+const PANEL_PATH = "ariadne";
 
 /** Calls an RPC method and refetches whenever the server signals a change. */
 function useLive<T>(load: () => Promise<T>, deps: unknown[]) {
@@ -149,7 +149,7 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
   return (
     <div>
       {visible.length === 0 ? (
-        <EmptyState>No open tasks. Hand Cyril a ticket in its thread.</EmptyState>
+        <EmptyState>No open tasks. Hand Ariadne a ticket in its thread.</EmptyState>
       ) : (
         <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
           {visible.map((task) => (
@@ -236,7 +236,7 @@ function NotesView({ workstream }: { workstream: string }) {
   const [openHistory, setOpenHistory] = useState<string | null>(null);
   if (data === null) return error === null ? <EmptyState>Loading notes…</EmptyState> : <ErrorLine error={error} />;
   if (data.notes.length === 0) {
-    return <EmptyState>No notes yet. Cyril writes them as workers finish.</EmptyState>;
+    return <EmptyState>No notes yet. Ariadne writes them as workers finish.</EmptyState>;
   }
   return (
     <div className="space-y-4">
@@ -340,7 +340,7 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
       onOpenChange(false);
       setName("");
       setLinks("");
-      navigate.toThread(result.cyrilThreadId);
+      navigate.toThread(result.ariadneThreadId);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -354,7 +354,7 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
         <form onSubmit={submit} className="space-y-4">
           <DialogHeader>
             <DialogTitle>New workstream</DialogTitle>
-            <DialogDescription>Creates a pinned Cyril thread you can hand tickets to.</DialogDescription>
+            <DialogDescription>Creates a pinned Ariadne thread you can hand tickets to.</DialogDescription>
           </DialogHeader>
           <label className="block space-y-1 text-sm">
             <span className="font-medium">Name</span>
@@ -420,7 +420,7 @@ function LessonsSection() {
     <section className="mt-8">
       <h3 className="text-sm font-semibold">Lessons</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        What Cyril has learned from you. Every Cyril follows these from its next session. Ask Cyril to change them, or
+        What Ariadne has learned from you. Every Ariadne follows these from its next session. Ask Ariadne to change them, or
         remove one here.
       </p>
       <ul className="mt-2 divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
@@ -457,7 +457,7 @@ function WorkstreamList() {
     <>
       <div className="flex items-center gap-2">
         <p className="flex-1 text-sm text-muted-foreground">
-          One Cyril per workstream. Hand it tickets in its thread; it runs the workers.
+          One Ariadne per workstream. Hand it tickets in its thread; it runs the workers.
         </p>
         <Button onClick={() => setCreating(true)}>
           <Icon name="Plus" className="size-4" />
@@ -486,8 +486,8 @@ function WorkstreamList() {
                   </span>
                 </button>
                 <Counts ws={ws} />
-                <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.cyrilThreadId)}>
-                  Open Cyril
+                <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+                  Open Ariadne
                 </Button>
               </li>
             ))}
@@ -526,8 +526,8 @@ function WorkstreamDetail({ name }: { name: string }) {
         <span className="flex-1" />
         {ws === null ? null : (
           <>
-            <Button size="sm" onClick={() => navigate.toThread(ws.cyrilThreadId)}>
-              Open Cyril
+            <Button size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+              Open Ariadne
             </Button>
             {ws.archived ? null : (
               <Button variant="outline" size="sm" onClick={() => setArchiving(true)}>
@@ -571,7 +571,7 @@ function WorkstreamDetail({ name }: { name: string }) {
           <DialogHeader>
             <DialogTitle>Archive {name}?</DialogTitle>
             <DialogDescription>
-              Archives the Cyril thread and its workers. Notes and the board stay readable here.
+              Archives the Ariadne thread and its workers. Notes and the board stay readable here.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -594,7 +594,7 @@ function WorkstreamDetail({ name }: { name: string }) {
   );
 }
 
-function CyrilPage({ subPath }: { subPath: string }) {
+function AriadnePage({ subPath }: { subPath: string }) {
   const name = subPath === "" ? null : decodeURIComponent(subPath.split("/")[0]!);
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
@@ -614,7 +614,7 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
   if (data.role === "none" || data.workstream === null) {
     return (
       <div className="p-3">
-        <EmptyState>This thread is not part of a Cyril workstream.</EmptyState>
+        <EmptyState>This thread is not part of a Ariadne workstream.</EmptyState>
       </div>
     );
   }
@@ -624,8 +624,8 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
       <div className="mb-3 flex items-center gap-2">
         <h3 className="flex-1 text-sm font-semibold">{data.workstream}</h3>
         {data.role === "worker" && ws !== null ? (
-          <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.cyrilThreadId)}>
-            Open Cyril
+          <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+            Open Ariadne
           </Button>
         ) : null}
         <Button
@@ -659,8 +659,8 @@ function HomeSection() {
             {ws.name}
           </button>
           <Counts ws={ws} />
-          <Button variant="ghost" size="sm" onClick={() => navigate.toThread(ws.cyrilThreadId)}>
-            Open Cyril
+          <Button variant="ghost" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+            Open Ariadne
           </Button>
         </li>
       ))}
@@ -670,23 +670,23 @@ function HomeSection() {
 
 export default definePluginApp((app) => {
   app.slots.navPanel({
-    id: "cyril",
-    title: "Cyril",
-    icon: "Users",
+    id: "ariadne",
+    title: "Ariadne",
+    icon: "ariadne/yarn",
     path: PANEL_PATH,
-    component: CyrilPage,
+    component: AriadnePage,
   });
   app.slots.threadPanelAction({
     id: "board",
-    title: "Cyril board",
+    title: "Ariadne board",
     component: ThreadBoardPanel,
     run: ({ openPanel }) => {
-      openPanel({ title: "Cyril board" });
+      openPanel({ title: "Ariadne board" });
     },
   });
   app.slots.homepageSection({
     id: "workstreams",
-    title: "Cyril workstreams",
+    title: "Ariadne workstreams",
     component: HomeSection,
   });
 });

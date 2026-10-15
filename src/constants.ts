@@ -5,4 +5,4 @@ export const TASK_STATUSES = ["running", "blocked", "in-review", "done", "droppe
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 /** Realtime channel published after any write the UI shows. */
-export const CHANGED_CHANNEL = "cyril-changed";
+export const CHANGED_CHANNEL = "ariadne-changed";

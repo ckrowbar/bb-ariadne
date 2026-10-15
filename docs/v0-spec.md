@@ -1,12 +1,12 @@
-# Cyril v0 spec
+# Ariadne v0 spec
 
-Status: draft for discussion, 2026-10-15.
+Status: built, 2026-10-15. Renamed from Cyril to Ariadne the same day.
 
 ## Goal
 
-One Cyril thread per workstream acts as the user's main contact. It keeps the
+One Ariadne thread per workstream acts as the user's main contact. It keeps the
 workstream's knowledge, spawns and steers worker threads for named tasks, and
-tracks what each worker is doing, including what it has put on staging. Cyril
+tracks what each worker is doing, including what it has put on staging. Ariadne
 is autonomous: it spawns and steers without asking, and escalates only on the
 cases listed below.
 
@@ -17,23 +17,23 @@ agents and scripting, not as the user's interface.
 
 - **Workstream.** A free-form name such as `chat-store` or `hackathon-q4`,
   with optional untyped links (Jira epic, docs, repos). There is no Jira
-  coupling. One Cyril thread per workstream.
+  coupling. One Ariadne thread per workstream.
 - **Task.** One unit of work handed to one worker, usually a ticket the user
   names. A task belongs to one workstream.
-- **Worker.** A child thread of Cyril that runs one task in its own BB-managed
+- **Worker.** A child thread of Ariadne that runs one task in its own BB-managed
   worktree.
 - **Staging log.** A record of what each worker integrated into the shared
   staging branch, when, and why. Staging is a shared merge branch
   (`chat-integrate <service>` "Integrate[s] a service to the staging branch"),
   so this is a log, not a lock.
 
-## How Cyril knows what to do
+## How Ariadne knows what to do
 
 | Layer | What | Where |
 | --- | --- | --- |
 | Standing orders | Role, autonomy, escalation rules, playbooks | Static instructions from `configure()` |
 | State | Notes, board, staging log | Plugin SQLite, read through tools |
-| Triggers | User messages, BB `child-completed`, worker reports, heartbeat digests | Arrive as turns on the Cyril thread |
+| Triggers | User messages, BB `child-completed`, worker reports, heartbeat digests | Arrive as turns on the Ariadne thread |
 
 Board state is read through tools, not injected into instructions. The plugin
 docs say "a live provider session keeps the instructions it was constructed
@@ -99,8 +99,8 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
 - **Branch names.** BB names the branch `bb/<title-slug>-<thread-id>`. A worker
   can `git branch -m` to the user's convention; BB shows the new name after its
   next status refresh. The plugin records the worktree's current branch on
-  each heartbeat (active tasks only), on every `cyril_report`, and from the
-  `branch` argument of `cyril_staging_log`, so a rename shows up even if the
+  each heartbeat (active tasks only), on every `ariadne_report`, and from the
+  `branch` argument of `ariadne_staging_log`, so a rename shows up even if the
   task finishes between heartbeats.
 - **PR detection works**, including checks: "#123379 draft ... Checks: pending
   (10 passed, 0 failed, 1 pending, 11 total)". BB's GitHub access does not
@@ -111,7 +111,7 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
 - **BB retires archived worktrees itself.** Archiving a thread puts its
   environment in `retiring` with a deadline about 5 minutes out, then BB tears
   it down, whatever its state. So the plugin cannot keep a worktree. It warns
-  Cyril during that window when work is at risk (unarchiving keeps it), and the
+  Ariadne during that window when work is at risk (unarchiving keeps it), and the
   Drop dialog shows the risk before you confirm.
 - **Environment ids arrive late.** `threads.spawn` returns before provisioning,
   so `environmentId` is null at spawn. The plugin resolves it from the thread
@@ -123,7 +123,7 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
 ## Data model (plugin SQLite)
 
 ```sql
-workstreams(name PRIMARY KEY, cyril_thread_id, links_json, created_at)
+workstreams(name PRIMARY KEY, ariadne_thread_id, links_json, created_at)
 notes(workstream, topic, body, revision, updated_at, PRIMARY KEY (workstream, topic))
 note_revisions(workstream, topic, revision, body, written_by_thread_id, written_at)
 tasks(id PRIMARY KEY, workstream, title, links_json, worker_thread_id,
@@ -139,7 +139,7 @@ Task `status`: `running`, `blocked`, `in-review`, `done`, `dropped`. A worker's
 `done` report keeps the task `in-review` while its PR is open; the heartbeat
 moves it to `done` when the PR merges.
 
-Notes are written only by machines (Cyril and the plugin). Every write keeps
+Notes are written only by machines (Ariadne and the plugin). Every write keeps
 the previous revision, so a bad update can be rolled back. Suggested starting
 topics: `overview`, `people`, `architecture`, `conventions`, `gotchas`.
 
@@ -148,37 +148,37 @@ topics: `overview`, `people`, `architecture`, `conventions`, `gotchas`.
 Selected per role by `configure()` from thread plugin metadata (verified in
 the spike).
 
-**Cyril threads**
+**Ariadne threads**
 
 | Tool | Does |
 | --- | --- |
-| `cyril_spawn_worker(title, prompt, links?, model?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
-| `cyril_board(status?)` | Lists this workstream's tasks: status, harvested, worker, branch, PR and checks state, summary. `bb cyril board` prints the same row |
-| `cyril_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
-| `cyril_notes_read(topic?)` / `cyril_notes_write(topic, body)` | Reads or replaces a note topic |
-| `cyril_staging(limit?)` | Lists recent staging log entries across all workstreams |
-| `cyril_lesson_add(text)` / `cyril_lesson_remove(id)` | Saves or removes a global lesson (see Self-improvement) |
-| `cyril_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo (see Self-improvement) |
+| `ariadne_spawn_worker(title, prompt, links?, model?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
+| `ariadne_board(status?)` | Lists this workstream's tasks: status, harvested, worker, branch, PR and checks state, summary. `bb ariadne board` prints the same row |
+| `ariadne_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
+| `ariadne_notes_read(topic?)` / `ariadne_notes_write(topic, body)` | Reads or replaces a note topic |
+| `ariadne_staging(limit?)` | Lists recent staging log entries across all workstreams |
+| `ariadne_lesson_add(text)` / `ariadne_lesson_remove(id)` | Saves or removes a global lesson (see Self-improvement) |
+| `ariadne_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo (see Self-improvement) |
 
 **Worker threads**
 
 | Tool | Does |
 | --- | --- |
-| `cyril_report(status, note, prUrl?)` | `pr-opened`, `blocked`, `fyi` or `done`. Updates the task and tells Cyril with `senderThreadId` set |
-| `cyril_staging_log(service, branch, purpose)` | Records an integration into staging. Workers call it right after `chat-integrate` |
+| `ariadne_report(status, note, prUrl?)` | `pr-opened`, `blocked`, `fyi` or `done`. Updates the task and tells Ariadne with `senderThreadId` set |
+| `ariadne_staging_log(service, branch, purpose)` | Records an integration into staging. Workers call it right after `chat-integrate` |
 
-Worker instructions explain the protocol and name the Cyril thread. They do
-not list siblings, because instructions go stale; Cyril puts siblings in the
+Worker instructions explain the protocol and name the Ariadne thread. They do
+not list siblings, because instructions go stale; Ariadne puts siblings in the
 kickoff prompt.
 
 ## Events and heartbeat
 
 | Source | Plugin does |
 | --- | --- |
-| BB `child-completed` | Nothing. BB delivers it to Cyril natively (spike finding 1) |
-| `interaction.pending` on a worker | Tells Cyril at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
-| `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Cyril if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
-| `thread.archived` on a Cyril thread | Marks the workstream archived |
+| BB `child-completed` | Nothing. BB delivers it to Ariadne natively (spike finding 1) |
+| `interaction.pending` on a worker | Tells Ariadne at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
+| `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Ariadne if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
+| `thread.archived` on a Ariadne thread | Marks the workstream archived |
 
 **Heartbeat.** A plugin timer that looks for things nobody reports. The checks
 are plain code and cost no model turns:
@@ -190,29 +190,30 @@ are plain code and cost no model turns:
 - `done` tasks not yet harvested into notes
 - staging log entries from different workstreams in the same hour, for the same service
 
-It sends Cyril one digest only when something changed. It ticks every 10
+It sends Ariadne one digest only when something changed. It ticks every 10
 minutes while there is activity and stops after 60 minutes with no changes.
 Any spawn, worker report or worker lifecycle event restarts it.
 
 ## Self-improvement
 
-The user can ask Cyril to fix or improve itself, and Cyril suggests it when a
+The user can ask Ariadne to fix or improve itself, and Ariadne suggests it when a
 problem is clearly its own. There are two paths:
 
 - **Lessons**, for behaviour that remembering can fix (a preference, a
-  playbook tweak). `cyril_lesson_add` stores a global lesson. Every Cyril
+  playbook tweak). `ariadne_lesson_add` stores a global lesson. Every Ariadne
   receives lessons through `contributeInstructions`, which has its own
   4096-character budget, so lessons never push the standing orders past BB's
-  cap. A live session keeps its instructions, so other Cyrils pick a lesson up
-  at their next session. Lessons are listed, and removable, on the Cyril page.
-- **Code**, for anything else. `cyril_improve` spawns a worker in a managed
+  cap. A live session keeps its instructions, so other Ariadne threads pick a lesson up
+  at their next session. Lessons are listed, and removable, on the Ariadne page.
+- **Code**, for anything else. `ariadne_improve` spawns a worker in a managed
   worktree of the plugin repo (BB project set by the `pluginProjectId` setting;
   `.bb-env-setup.sh` runs `npm ci`). The worker typechecks, builds, pushes a
-  branch and opens a draft PR in `ckrowbar/bb-cyril`. It never touches the
+  branch and opens a draft PR in the plugin repo (read from the project's git
+  remote). It never touches the
   live plugin checkout.
-- **Applying.** Nothing changes until the user merges and asks Cyril to apply
-  it. Cyril then pulls the checkout, runs `npm ci` if the lockfile changed,
-  builds and reloads the plugin. A reviewed PR is the guard against Cyril
+- **Applying.** Nothing changes until the user merges and asks Ariadne to apply
+  it. Ariadne then pulls the checkout, runs `npm ci` if the lockfile changed,
+  builds and reloads the plugin. A reviewed PR is the guard against Ariadne
   widening its own permissions.
 
 Verified 2026-10-15: lesson 1 (Haiku for throwaway tasks) was followed on the
@@ -227,23 +228,23 @@ open threads through BB navigation.
 
 | Human interaction | Where you click |
 | --- | --- |
-| Start a workstream | **Cyril** sidebar page → **New workstream** (name, optional links). Creates a pinned Cyril thread and opens it |
-| Talk to Cyril, hand it a ticket | The pinned Cyril thread. Plain chat |
-| See what is going on | **Cyril** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
-| Same, without leaving the chat | **Board** thread panel on the Cyril thread, same rows beside the conversation |
-| Answer an escalation | Cyril asks with the provider's native question UI so answers are clicks. Verified for Claude Code in the worktree test. Free-form questions are ordinary chat |
-| Unstick a worker waiting on approval | Cyril's alert links the worker thread. BB's native approve or deny controls are there |
-| Check what Cyril knows | **Notes** tab: read-only topics with revision history |
+| Start a workstream | **Ariadne** sidebar page → **New workstream** (name, optional links). Creates a pinned Ariadne thread and opens it |
+| Talk to Ariadne, hand it a ticket | The pinned Ariadne thread. Plain chat |
+| See what is going on | **Ariadne** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
+| Same, without leaving the chat | **Board** thread panel on the Ariadne thread, same rows beside the conversation |
+| Answer an escalation | Ariadne asks with the provider's native question UI so answers are clicks. Verified for Claude Code in the worktree test. Free-form questions are ordinary chat |
+| Unstick a worker waiting on approval | Ariadne's alert links the worker thread. BB's native approve or deny controls are there |
+| Check what Ariadne knows | **Notes** tab: read-only topics with revision history |
 | See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
 | Drop a task | **Drop** on the board row. The dialog shows uncommitted or unpushed work first. Archives the worker thread and marks the task `dropped` |
-| Review what Cyril has learned | **Lessons** list on the Cyril page, with **Remove** |
+| Review what Ariadne has learned | **Lessons** list on the Ariadne page, with **Remove** |
 | Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
-| Retire a workstream | **Archive** on the workstream page. Archives the Cyril thread and its workers |
+| Retire a workstream | **Archive** on the workstream page. Archives the Ariadne thread and its workers |
 
 Data reaches the UI through plugin RPC, and a realtime signal refreshes open
 views when the board, notes or staging log change.
 
-Later, if useful: a status chip in the Cyril thread header
+Later, if useful: a status chip in the Ariadne thread header
 (`experimental_threadHeaderAction`) and `#task` mentions in the composer
 (`bb.ui.registerMentionProvider`).
 
@@ -252,11 +253,11 @@ Later, if useful: a status chip in the Cyril thread header
 For agents and scripting.
 
 ```
-bb cyril create <workstream> [--project <id>] [--link <url>]...
-bb cyril list                      # workstreams and their Cyril threads
-bb cyril board <workstream>        # same rows as cyril_board
-bb cyril notes <workstream> [topic]
-bb cyril staging [--limit <n>]
+bb ariadne create <workstream> [--project <id>] [--link <url>]...
+bb ariadne list                      # workstreams and their Ariadne threads
+bb ariadne board <workstream>        # same rows as ariadne_board
+bb ariadne notes <workstream> [topic]
+bb ariadne staging [--limit <n>]
 ```
 
 ## Out of scope for v0
@@ -265,7 +266,7 @@ bb cyril staging [--limit <n>]
 - Enforcing anything through the `message.dispatch` hook. It is experimental.
 - Multi-machine correctness. The plugin assumes the server and workers share
   a host.
-- Teammates' staging changes. The log covers only Cyril workers.
+- Teammates' staging changes. The log covers only Ariadne workers.
 
 ## Open questions
 

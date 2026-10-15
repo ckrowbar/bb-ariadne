@@ -40,7 +40,7 @@ export type Task = z.infer<typeof taskSchema>;
 
 const workstreamSchema = z.object({
   name: z.string(),
-  cyrilThreadId: z.string(),
+  ariadneThreadId: z.string(),
   projectId: z.string(),
   projectName: z.string().nullable(),
   links: z.array(z.string()),
@@ -100,7 +100,7 @@ export const rpcContract = defineRpcContract({
       projectId: z.string(),
       links: z.array(z.string().trim().min(1)).max(20),
     }),
-    output: z.object({ cyrilThreadId: z.string() }),
+    output: z.object({ ariadneThreadId: z.string() }),
   },
   workstream_archive: {
     input: z.object({ name: z.string() }),
@@ -137,7 +137,7 @@ export const rpcContract = defineRpcContract({
   thread_context: {
     input: z.object({ threadId: z.string() }),
     output: z.object({
-      role: z.enum(["cyril", "worker", "none"]),
+      role: z.enum(["ariadne", "worker", "none"]),
       workstream: z.string().nullable(),
       taskId: z.string().nullable(),
     }),

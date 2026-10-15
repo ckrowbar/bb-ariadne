@@ -1,4 +1,4 @@
-// One board row format, shared by the cyril_board tool and `bb cyril board`.
+// One board row format, shared by the ariadne_board tool and `bb ariadne board`.
 import type { Task } from "./contract";
 
 /**

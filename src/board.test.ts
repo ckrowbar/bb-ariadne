@@ -5,12 +5,12 @@ import type { Task } from "./contract";
 
 const task: Task = {
   id: "t_a792b619",
-  workstream: "cyril-e2e",
+  workstream: "ariadne-e2e",
   title: "e2e toy task",
   links: [],
   workerThreadId: "thr_fad9p9ngt7",
   environmentId: null,
-  branch: "cyrus.kalafchi/CYRIL-E2E/toy-test",
+  branch: "cyrus.kalafchi/ARIADNE-E2E/toy-test",
   status: "done",
   prUrl: null,
   pr: {

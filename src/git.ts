@@ -83,13 +83,13 @@ export async function refreshBase(repoPath: string, remoteUrl: string | null, br
   if (remote === null) {
     warning = `cannot parse GitHub remote ${remoteUrl ?? "(none)"}`;
   } else {
-    const dir = await mkdtemp(join(tmpdir(), "cyril-askpass-"));
+    const dir = await mkdtemp(join(tmpdir(), "ariadne-askpass-"));
     const askpass = join(dir, "askpass.sh");
     try {
       const token = await githubToken(remote.owner);
       await writeFile(
         askpass,
-        '#!/bin/sh\ncase "$1" in *sername*) echo x-access-token ;; *) printf \'%s\\n\' "$CYRIL_GH_TOKEN" ;; esac\n',
+        '#!/bin/sh\ncase "$1" in *sername*) echo x-access-token ;; *) printf \'%s\\n\' "$ARIADNE_GH_TOKEN" ;; esac\n',
       );
       await chmod(askpass, 0o700);
       await git(
@@ -105,7 +105,7 @@ export async function refreshBase(repoPath: string, remoteUrl: string | null, br
           `+refs/heads/${branch}:${localRef}`,
         ],
         {
-          CYRIL_GH_TOKEN: token,
+          ARIADNE_GH_TOKEN: token,
           GIT_ASKPASS: askpass,
           GIT_ASKPASS_REQUIRE: "force",
           GIT_TERMINAL_PROMPT: "0",

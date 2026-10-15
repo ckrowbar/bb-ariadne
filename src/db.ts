@@ -10,7 +10,7 @@ type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 
 export interface WorkstreamRow {
   name: string;
-  cyril_thread_id: string;
+  ariadne_thread_id: string;
   project_id: string;
   links_json: string;
   archived_at: number | null;
@@ -45,7 +45,7 @@ export interface BranchCleanupRow {
 const MIGRATIONS = [
   `CREATE TABLE workstreams (
      name TEXT PRIMARY KEY,
-     cyril_thread_id TEXT NOT NULL UNIQUE,
+     ariadne_thread_id TEXT NOT NULL UNIQUE,
      project_id TEXT NOT NULL,
      links_json TEXT NOT NULL DEFAULT '[]',
      archived_at INTEGER,
@@ -107,7 +107,7 @@ const MIGRATIONS = [
      key TEXT PRIMARY KEY,
      signature TEXT NOT NULL,
      updated_at INTEGER NOT NULL)`,
-  // Lessons are global: behaviour adjustments every Cyril reads at session start.
+  // Lessons are global: behaviour adjustments every Ariadne reads at session start.
   `CREATE TABLE lessons (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
      text TEXT NOT NULL,
@@ -152,18 +152,18 @@ export function openStore(bb: BbPluginApi) {
     workstream(name: string): WorkstreamRow | undefined {
       return db.prepare("SELECT * FROM workstreams WHERE name = ?").get(name) as WorkstreamRow | undefined;
     },
-    workstreamByCyril(threadId: string): WorkstreamRow | undefined {
-      return db.prepare("SELECT * FROM workstreams WHERE cyril_thread_id = ?").get(threadId) as
+    workstreamByAriadne(threadId: string): WorkstreamRow | undefined {
+      return db.prepare("SELECT * FROM workstreams WHERE ariadne_thread_id = ?").get(threadId) as
         | WorkstreamRow
         | undefined;
     },
     workstreams(): WorkstreamRow[] {
       return db.prepare("SELECT * FROM workstreams ORDER BY archived_at IS NOT NULL, created_at DESC").all() as WorkstreamRow[];
     },
-    insertWorkstream(name: string, cyrilThreadId: string, projectId: string, links: string[]) {
+    insertWorkstream(name: string, ariadneThreadId: string, projectId: string, links: string[]) {
       db.prepare(
-        "INSERT INTO workstreams (name, cyril_thread_id, project_id, links_json, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).run(name, cyrilThreadId, projectId, JSON.stringify(links), Date.now());
+        "INSERT INTO workstreams (name, ariadne_thread_id, project_id, links_json, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).run(name, ariadneThreadId, projectId, JSON.stringify(links), Date.now());
     },
     archiveWorkstream(name: string) {
       db.prepare("UPDATE workstreams SET archived_at = ? WHERE name = ? AND archived_at IS NULL").run(Date.now(), name);

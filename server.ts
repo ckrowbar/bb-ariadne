@@ -1,6 +1,6 @@
-// bb-plugin-cyril — backend entry.
+// bb-plugin-ariadne — backend entry.
 //
-// Cyril is a manager thread per workstream. It spawns worker threads into
+// Ariadne is a manager thread per workstream. It spawns worker threads into
 // BB-managed worktrees, tracks them on a board, keeps machine-maintained notes
 // and a staging log, and hears about workers through BB's native
 // child-completed notification plus this plugin's targeted alerts.
@@ -17,20 +17,26 @@ import {
   currentBranch,
   defaultBranch,
   deleteBranch,
+  parseGitHubRemote,
   refreshBase,
   worktreeDirt,
 } from "./src/git";
-import { cyrilInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
+import { ariadneInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
 
-interface CyrilMetadata {
-  role?: "cyril" | "worker";
+interface AriadneMetadata {
+  role?: "ariadne" | "worker";
   workstream?: string;
-  cyrilThreadId?: string;
+  ariadneThreadId?: string;
   taskId?: string;
 }
 
 const HEARTBEAT_CRON = "*/10 * * * *";
-const PLUGIN_PREFIX = "[cyril plugin]";
+// BB's sidebar has no per-thread custom icons (row indicators are a fixed
+// set), so titles carry the mark: a ball of yarn for Ariadne, a thread for
+// each worker.
+const ARIADNE_MARK = "🧶";
+const WORKER_MARK = "🧵";
+const PLUGIN_PREFIX = "[ariadne plugin]";
 
 function text(value: string) {
   return [{ type: "text" as const, text: value, mentions: [] }];
@@ -49,8 +55,14 @@ function describeInteraction(interaction: unknown): string {
   return prompt === "" ? kind : `${kind}: ${prompt}`;
 }
 
-function improvementKickoff(input: { problem: string; evidence?: string; proposal?: string; requestedBy: string }): string {
-  return `You are improving Cyril, the BB plugin that runs manager threads (this repo). Cyril @thread:${input.requestedBy} asked for this change on the user's behalf.
+function improvementKickoff(input: {
+  problem: string;
+  evidence?: string;
+  proposal?: string;
+  requestedBy: string;
+  repo: string;
+}): string {
+  return `You are improving Ariadne, the BB plugin that runs manager threads (this repo). Ariadne @thread:${input.requestedBy} asked for this change on the user's behalf.
 
 ## Problem
 ${input.problem}
@@ -61,15 +73,15 @@ ${input.evidence ? `\n## Evidence\n${input.evidence}\n` : ""}${input.proposal ? 
 - Plugin authoring docs: the bb-plugin-authoring skill.
 
 ## Definition of done
-A draft PR in ckrowbar/bb-cyril with the change, a "## Motivation" section, and open questions listed.
+A draft PR in ${input.repo} with the change, a "## Motivation" section, and open questions listed.
 
 ## Rules
 - Run npm ci if node_modules is missing. Before committing: npx tsc -p . must pass, and bb plugin build must succeed.
 - Keep the change small and focused on the problem. Match the surrounding code style.
 - Never reload, reinstall or edit the live plugin checkout; the user applies merged changes.
 - Commit on your branch, then push with: env -u GH_TOKEN -u GITHUB_TOKEN git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push -u origin HEAD
-- Open the PR with: env -u GH_TOKEN -u GITHUB_TOKEN gh pr create --draft -R ckrowbar/bb-cyril
-- Report the PR with cyril_report (status pr-opened, prUrl), then finish with cyril_report done.`;
+- Open the PR with: env -u GH_TOKEN -u GITHUB_TOKEN gh pr create --draft -R ${input.repo}
+- Report the PR with ariadne_report (status pr-opened, prUrl), then finish with ariadne_report done.`;
 }
 
 export default async function plugin(bb: BbPluginApi) {
@@ -86,9 +98,9 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Model for worker threads. Empty uses the provider default.",
       default: "",
     },
-    cyrilProvider: {
+    ariadneProvider: {
       type: "string",
-      label: "Cyril provider",
+      label: "Ariadne provider",
       default: "claude-code",
     },
     branchConvention: {
@@ -100,7 +112,7 @@ export default async function plugin(bb: BbPluginApi) {
     pluginProjectId: {
       type: "string",
       label: "Plugin repo project",
-      description: "BB project id for this plugin's own repo. cyril_improve spawns workers there. Empty disables cyril_improve.",
+      description: "BB project id for this plugin's own repo. ariadne_improve spawns workers there. Empty disables ariadne_improve.",
       default: "",
     },
     stuckMinutes: {
@@ -134,15 +146,15 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const publish = () => bb.realtime.publish(CHANGED_CHANNEL, { at: Date.now() });
 
-  async function metadataOf(threadId: string): Promise<CyrilMetadata> {
-    return (await bb.sdk.threads.getPluginMetadata({ threadId })) as CyrilMetadata;
+  async function metadataOf(threadId: string): Promise<AriadneMetadata> {
+    return (await bb.sdk.threads.getPluginMetadata({ threadId })) as AriadneMetadata;
   }
 
-  async function tellCyril(cyrilThreadId: string, message: string, senderThreadId?: string) {
+  async function tellAriadne(ariadneThreadId: string, message: string, senderThreadId?: string) {
     try {
-      await bb.sdk.threads.send({ threadId: cyrilThreadId, mode: "auto", input: text(message), senderThreadId });
+      await bb.sdk.threads.send({ threadId: ariadneThreadId, mode: "auto", input: text(message), senderThreadId });
     } catch (error) {
-      bb.log.warn(`tell cyril ${cyrilThreadId} failed: ${String(error)}`);
+      bb.log.warn(`tell ariadne ${ariadneThreadId} failed: ${String(error)}`);
     }
   }
 
@@ -175,7 +187,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function createWorkstream(name: string, projectId: string, links: string[]): Promise<string> {
     if (store.workstream(name) !== undefined) throw new Error(`Workstream "${name}" already exists.`);
     const source = await projectSource(projectId);
-    // Cyril reads code in the shared checkout for kickoffs; its instructions
+    // Ariadne reads code in the shared checkout for kickoffs; its instructions
     // forbid editing there. Personal projects get a personal workspace.
     const environment =
       source.kind === "standard" && source.path !== null
@@ -188,12 +200,12 @@ export default async function plugin(bb: BbPluginApi) {
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment,
-      title: `Cyril · ${name}`,
-      prompt: `${PLUGIN_PREFIX} You are Cyril for the workstream ${JSON.stringify(name)}. Introduce yourself in two sentences: what you can do, and that the user can hand you tickets here.`,
+      title: `${ARIADNE_MARK} ${name}`,
+      prompt: `${PLUGIN_PREFIX} You are Ariadne for the workstream ${JSON.stringify(name)}. Introduce yourself in two sentences: what you can do, and that the user can hand you tickets here.`,
       pinned: true,
-      providerId: config.cyrilProvider || undefined,
+      providerId: config.ariadneProvider || undefined,
       permissionMode: "full",
-      pluginMetadata: { role: "cyril", workstream: name },
+      pluginMetadata: { role: "ariadne", workstream: name },
     });
     store.insertWorkstream(name, thread.id, projectId, links);
     store.event("workstream-created", thread.id, name);
@@ -202,11 +214,11 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function spawnWorker(
-    cyrilThreadId: string,
+    ariadneThreadId: string,
     args: { title: string; prompt: string; links?: string[]; model?: string; baseBranch?: string; projectId?: string },
   ): Promise<{ task: Task; note: string }> {
-    const ws = store.workstreamByCyril(cyrilThreadId);
-    if (ws === undefined) throw new Error("This Cyril thread has no workstream record.");
+    const ws = store.workstreamByAriadne(ariadneThreadId);
+    if (ws === undefined) throw new Error("This Ariadne thread has no workstream record.");
     const projectId = args.projectId ?? ws.project_id;
     const source = await projectSource(projectId);
     let environment;
@@ -227,13 +239,13 @@ export default async function plugin(bb: BbPluginApi) {
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment,
-      title: args.title,
+      title: `${WORKER_MARK} ${args.title}`,
       prompt: args.prompt,
       providerId: config.workerProvider || undefined,
       model: args.model ?? (config.workerModel || undefined),
       permissionMode: "full",
-      parentThreadId: cyrilThreadId,
-      pluginMetadata: { role: "worker", workstream: ws.name, cyrilThreadId },
+      parentThreadId: ariadneThreadId,
+      pluginMetadata: { role: "worker", workstream: ws.name, ariadneThreadId },
     });
     const task = store.insertTask({
       workstream: ws.name,
@@ -288,7 +300,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   /**
    * BB retires an archived thread's worktree on its own, about 5 minutes after
-   * archive (observed 2026-10-15). In that window, warn Cyril if work would be
+   * archive (observed 2026-10-15). In that window, warn Ariadne if work would be
    * lost (unarchiving the worker keeps it). Otherwise queue the local branch
    * for deletion once teardown finishes. A branch with unpushed commits is
    * never deleted, so committed work survives in the repo either way.
@@ -308,8 +320,8 @@ export default async function plugin(bb: BbPluginApi) {
       const ws = store.workstream(task.workstream);
       const when = env.lifecycle.retireAt === null ? "soon" : `at ${new Date(env.lifecycle.retireAt).toISOString()}`;
       if (ws !== undefined)
-        await tellCyril(
-          ws.cyril_thread_id,
+        await tellAriadne(
+          ws.ariadne_thread_id,
           `${PLUGIN_PREFIX} Archived task ${task.id} (${task.title}) has ${risk}. BB removes its worktree ${when}; unarchiving @thread:${task.workerThreadId} keeps it. Tell the user now if the work matters.`,
         );
       if (risk.startsWith("branch")) return;
@@ -449,7 +461,7 @@ export default async function plugin(bb: BbPluginApi) {
     for (const [workstream, lines] of digest) {
       const ws = store.workstream(workstream);
       if (ws === undefined || ws.archived_at !== null || lines.length === 0) continue;
-      await tellCyril(ws.cyril_thread_id, `${PLUGIN_PREFIX} Heartbeat digest:\n- ${lines.join("\n- ")}`);
+      await tellAriadne(ws.ariadne_thread_id, `${PLUGIN_PREFIX} Heartbeat digest:\n- ${lines.join("\n- ")}`);
       markActivity();
     }
     if (digest.size > 0) publish();
@@ -458,7 +470,7 @@ export default async function plugin(bb: BbPluginApi) {
   async function workstreamView(row: WorkstreamRow): Promise<Workstream> {
     return {
       name: row.name,
-      cyrilThreadId: row.cyril_thread_id,
+      ariadneThreadId: row.ariadne_thread_id,
       projectId: row.project_id,
       projectName: await projectName(row.project_id),
       links: store.links(row),
@@ -471,23 +483,23 @@ export default async function plugin(bb: BbPluginApi) {
 
   // configure() is synchronous; better-sqlite3 lets it read the workstream.
   bb.agents.configure((context) => {
-    const meta = context.pluginMetadata as CyrilMetadata;
-    if (meta.role === "cyril") {
-      const ws = store.workstreamByCyril(context.thread.id);
+    const meta = context.pluginMetadata as AriadneMetadata;
+    if (meta.role === "ariadne") {
+      const ws = store.workstreamByAriadne(context.thread.id);
       return {
         tools: [
-          "cyril_spawn_worker",
-          "cyril_board",
-          "cyril_task_update",
-          "cyril_notes_read",
-          "cyril_notes_write",
-          "cyril_staging",
-          "cyril_lesson_add",
-          "cyril_lesson_remove",
-          ...(config.pluginProjectId === "" ? [] : ["cyril_improve"]),
+          "ariadne_spawn_worker",
+          "ariadne_board",
+          "ariadne_task_update",
+          "ariadne_notes_read",
+          "ariadne_notes_write",
+          "ariadne_staging",
+          "ariadne_lesson_add",
+          "ariadne_lesson_remove",
+          ...(config.pluginProjectId === "" ? [] : ["ariadne_improve"]),
         ],
         skills: [],
-        instructions: cyrilInstructions({
+        instructions: ariadneInstructions({
           workstream: ws?.name ?? String(meta.workstream ?? "unknown"),
           links: ws === undefined ? [] : store.links(ws),
           projectName: projectNames.get(ws?.project_id ?? "") ?? context.project.name,
@@ -495,12 +507,12 @@ export default async function plugin(bb: BbPluginApi) {
         }),
       };
     }
-    if (meta.role === "worker" && typeof meta.cyrilThreadId === "string") {
+    if (meta.role === "worker" && typeof meta.ariadneThreadId === "string") {
       return {
-        tools: ["cyril_report", "cyril_staging_log"],
+        tools: ["ariadne_report", "ariadne_staging_log"],
         skills: [],
         instructions: workerInstructions({
-          cyrilThreadId: meta.cyrilThreadId,
+          ariadneThreadId: meta.ariadneThreadId,
           taskId: String(meta.taskId ?? "unknown"),
           // The convention is for the user's work repos, not this plugin's repo.
           branchConvention: context.project.id === config.pluginProjectId ? "" : config.branchConvention,
@@ -511,16 +523,16 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.contributeInstructions(({ threadId }) =>
-    store.workstreamByCyril(threadId) === undefined ? null : lessonsInstructions(store.lessons()),
+    store.workstreamByAriadne(threadId) === undefined ? null : lessonsInstructions(store.lessons()),
   );
 
-  async function requireCyril(threadId: string): Promise<WorkstreamRow | string> {
-    const ws = store.workstreamByCyril(threadId);
-    return ws ?? "Only a Cyril thread can use this tool.";
+  async function requireAriadne(threadId: string): Promise<WorkstreamRow | string> {
+    const ws = store.workstreamByAriadne(threadId);
+    return ws ?? "Only a Ariadne thread can use this tool.";
   }
 
   bb.agents.registerTool({
-    name: "cyril_spawn_worker",
+    name: "ariadne_spawn_worker",
     description: "Spawn a worker thread for one task in its own worktree, and add the task to the board.",
     presentation: { label: { pending: "Spawning worker", completed: "Spawned worker" } },
     parameters: z.object({
@@ -531,7 +543,7 @@ export default async function plugin(bb: BbPluginApi) {
       baseBranch: z.string().optional().describe("Base branch to fork from; defaults to the repo default branch"),
     }),
     async execute(args, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const { task, note } = await spawnWorker(threadId, args);
       return `Spawned worker @thread:${task.workerThreadId} for task ${task.id} (${task.title}); ${note}.`;
@@ -539,12 +551,12 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_board",
+    name: "ariadne_board",
     description: "List this workstream's tasks with status, worker thread, branch and PR state.",
     presentation: { label: { pending: "Reading board", completed: "Read board" }, suppress: true },
     parameters: z.object({ status: z.enum(TASK_STATUSES).optional() }),
     async execute({ status }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const tasks = store.tasks(ws.name, status);
       if (tasks.length === 0) return "No tasks.";
@@ -553,7 +565,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_task_update",
+    name: "ariadne_task_update",
     description: "Update a task on the board.",
     presentation: { label: { pending: "Updating task", completed: "Updated task" } },
     parameters: z.object({
@@ -564,7 +576,7 @@ export default async function plugin(bb: BbPluginApi) {
       harvested: z.boolean().optional(),
     }),
     async execute({ taskId, ...changes }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const task = store.task(taskId);
       if (task === undefined || task.workstream !== ws.name) return errorText(`No task ${taskId} in this workstream.`);
@@ -576,12 +588,12 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_notes_read",
+    name: "ariadne_notes_read",
     description: "Read this workstream's notes. Omit topic to list all topics with their content.",
     presentation: { label: { pending: "Reading notes", completed: "Read notes" }, suppress: true },
     parameters: z.object({ topic: z.string().optional() }),
     async execute({ topic }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const notes = store.notes(ws.name, 0).filter((n) => topic === undefined || n.topic === topic);
       if (notes.length === 0) return topic === undefined ? "No notes yet." : `No note "${topic}".`;
@@ -590,7 +602,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_notes_write",
+    name: "ariadne_notes_write",
     description:
       "Replace a note topic with a new body. Previous versions are kept. Suggested topics: overview, people, architecture, conventions, gotchas.",
     presentation: { label: { pending: "Updating notes", completed: "Updated notes" } },
@@ -599,7 +611,7 @@ export default async function plugin(bb: BbPluginApi) {
       body: z.string().min(1).max(20_000),
     }),
     async execute({ topic, body }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const revision = store.writeNote(ws.name, topic, body, threadId);
       publish();
@@ -608,12 +620,12 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_staging",
-    description: "List recent staging integrations by Cyril workers across all workstreams.",
+    name: "ariadne_staging",
+    description: "List recent staging integrations by Ariadne workers across all workstreams.",
     presentation: { label: { pending: "Reading staging log", completed: "Read staging log" }, suppress: true },
     parameters: z.object({ limit: z.number().int().min(1).max(100).optional() }),
     async execute({ limit }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const entries = store.staging(limit ?? 20);
       if (entries.length === 0) return "No staging integrations logged.";
@@ -625,28 +637,28 @@ export default async function plugin(bb: BbPluginApi) {
 
 
   bb.agents.registerTool({
-    name: "cyril_lesson_add",
+    name: "ariadne_lesson_add",
     description:
-      "Remember a behaviour adjustment for every Cyril, e.g. a user preference or playbook tweak. Applies from each Cyril's next session.",
+      "Remember a behaviour adjustment for every Ariadne, e.g. a user preference or playbook tweak. Applies from each Ariadne's next session.",
     presentation: { label: { pending: "Saving lesson", completed: "Saved lesson" } },
     parameters: z.object({ text: z.string().min(5).max(400) }),
     async execute({ text: lesson }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const id = store.addLesson(lesson, threadId);
       store.event("lesson-added", lesson, ws.name);
       publish();
-      return `Saved lesson ${id}. Follow it now; other Cyrils pick it up at their next session.`;
+      return `Saved lesson ${id}. Follow it now; other Ariadne threads pick it up at their next session.`;
     },
   });
 
   bb.agents.registerTool({
-    name: "cyril_lesson_remove",
+    name: "ariadne_lesson_remove",
     description: "Remove a lesson that is wrong or stale, by id.",
     presentation: { label: { pending: "Removing lesson", completed: "Removed lesson" } },
     parameters: z.object({ id: z.number().int() }),
     async execute({ id }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       if (!store.removeLesson(id)) return errorText(`No lesson ${id}.`);
       store.event("lesson-removed", String(id), ws.name);
@@ -656,10 +668,10 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_improve",
+    name: "ariadne_improve",
     description:
-      "Fix or improve Cyril itself. Spawns a worker in the plugin repo that makes the change and opens a draft PR for the user to review. Nothing changes in the running plugin until the user merges and asks you to apply it.",
-    presentation: { label: { pending: "Starting a Cyril improvement", completed: "Started a Cyril improvement" } },
+      "Fix or improve Ariadne itself. Spawns a worker in the plugin repo that makes the change and opens a draft PR for the user to review. Nothing changes in the running plugin until the user merges and asks you to apply it.",
+    presentation: { label: { pending: "Starting a Ariadne improvement", completed: "Started a Ariadne improvement" } },
     parameters: z.object({
       title: z.string().min(1).max(100).describe("Short title, e.g. 'Show harvested state on the board'"),
       problem: z.string().min(1).max(4000).describe("What is wrong or missing, from the user's point of view"),
@@ -667,12 +679,14 @@ export default async function plugin(bb: BbPluginApi) {
       proposal: z.string().max(4000).optional().describe("Suggested change, if you have one"),
     }),
     async execute({ title, problem, evidence, proposal }, { threadId }) {
-      const ws = await requireCyril(threadId);
+      const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
-      if (config.pluginProjectId === "") return errorText("cyril_improve is not configured (pluginProjectId).");
+      if (config.pluginProjectId === "") return errorText("ariadne_improve is not configured (pluginProjectId).");
+      const remote = parseGitHubRemote((await projectSource(config.pluginProjectId)).remoteUrl);
+      if (remote === null) return errorText("The plugin repo project has no GitHub remote.");
       const { task, note } = await spawnWorker(threadId, {
-        title: `Improve Cyril: ${title}`,
-        prompt: improvementKickoff({ problem, evidence, proposal, requestedBy: threadId }),
+        title: `Improve Ariadne: ${title}`,
+        prompt: improvementKickoff({ problem, evidence, proposal, requestedBy: threadId, repo: `${remote.owner}/${remote.repo}` }),
         projectId: config.pluginProjectId,
       });
       store.event("improvement-started", title, ws.name, task.id);
@@ -681,9 +695,9 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
-    name: "cyril_report",
-    description: "Report to your Cyril manager: pr-opened, blocked, done or fyi.",
-    presentation: { label: { pending: "Reporting to Cyril", completed: "Reported to Cyril" } },
+    name: "ariadne_report",
+    description: "Report to your Ariadne manager: pr-opened, blocked, done or fyi.",
+    presentation: { label: { pending: "Reporting to Ariadne", completed: "Reported to Ariadne" } },
     parameters: z.object({
       status: z.enum(["pr-opened", "blocked", "done", "fyi"]),
       note: z.string().min(1).max(4000),
@@ -692,8 +706,8 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ status, note, prUrl }, { threadId }) {
       const meta = await metadataOf(threadId);
       const task = store.taskByWorker(threadId);
-      if (meta.role !== "worker" || meta.cyrilThreadId === undefined || task === undefined) {
-        return errorText("This thread is not a Cyril worker.");
+      if (meta.role !== "worker" || meta.ariadneThreadId === undefined || task === undefined) {
+        return errorText("This thread is not a Ariadne worker.");
       }
       const statusChange = { "pr-opened": "in-review", blocked: "blocked", done: "done", fyi: undefined } as const;
       // "done" with an unmerged PR still needs the user's review, so keep it visible.
@@ -707,17 +721,17 @@ export default async function plugin(bb: BbPluginApi) {
       store.event(`report-${status}`, note, task.workstream, task.id);
       markActivity();
       publish();
-      await tellCyril(
-        meta.cyrilThreadId,
+      await tellAriadne(
+        meta.ariadneThreadId,
         `${PLUGIN_PREFIX} Worker @thread:${threadId} (${task.id}, ${task.title}) reports ${status}${prUrl ? ` ${prUrl}` : ""}: ${note}`,
         threadId,
       );
-      return "Reported to Cyril.";
+      return "Reported to Ariadne.";
     },
   });
 
   bb.agents.registerTool({
-    name: "cyril_staging_log",
+    name: "ariadne_staging_log",
     description: "Record that you integrated a branch into staging. Call right after chat-integrate or similar.",
     presentation: { label: { pending: "Logging staging integration", completed: "Logged staging integration" } },
     parameters: z.object({
@@ -727,7 +741,7 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     async execute({ service, branch, purpose }, { threadId }) {
       const task = store.taskByWorker(threadId);
-      if (task === undefined) return errorText("This thread is not a Cyril worker.");
+      if (task === undefined) return errorText("This thread is not a Ariadne worker.");
       store.logStaging({ workstream: task.workstream, workerThreadId: threadId, taskId: task.id, service, branch, purpose });
       store.updateTask(task.id, { branch });
       store.event("staging", `${service} ${branch}`, task.workstream, task.id);
@@ -739,7 +753,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ----------------------------------------------------------------- events
 
-  // BB's native child-completed notification tells Cyril when a worker
+  // BB's native child-completed notification tells Ariadne when a worker
   // finishes (spike finding 1). These handlers cover what BB does not.
   bb.events.on("interaction.pending", async ({ thread, interaction }) => {
     if (thread.originPluginId !== bb.pluginId) return;
@@ -748,8 +762,8 @@ export default async function plugin(bb: BbPluginApi) {
     const ws = store.workstream(task.workstream);
     if (ws === undefined) return;
     markActivity();
-    await tellCyril(
-      ws.cyril_thread_id,
+    await tellAriadne(
+      ws.ariadne_thread_id,
       `${PLUGIN_PREFIX} Worker @thread:${thread.id} (${task.id}, ${task.title}) is waiting on ${describeInteraction(interaction)}. It is stalled until someone answers in that thread.`,
       thread.id,
     );
@@ -757,7 +771,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.events.on("thread.archived", async ({ thread }) => {
     if (thread.originPluginId !== bb.pluginId) return;
-    const ws = store.workstreamByCyril(thread.id);
+    const ws = store.workstreamByAriadne(thread.id);
     if (ws !== undefined) {
       store.archiveWorkstream(ws.name);
       publish();
@@ -775,7 +789,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.unarchived", ({ thread }) => {
-    const ws = store.workstreamByCyril(thread.id);
+    const ws = store.workstreamByAriadne(thread.id);
     if (ws === undefined || ws.archived_at === null) return;
     store.unarchiveWorkstream(ws.name);
     publish();
@@ -801,12 +815,12 @@ export default async function plugin(bb: BbPluginApi) {
       return { projects: projects.map((p) => ({ id: p.id, name: p.name, kind: p.kind })) };
     },
     workstream_create: async ({ name, projectId, links }) => ({
-      cyrilThreadId: await createWorkstream(name, projectId, links),
+      ariadneThreadId: await createWorkstream(name, projectId, links),
     }),
     workstream_archive: async ({ name }) => {
       const ws = store.workstream(name);
       if (ws === undefined) throw new Error(`No workstream ${name}.`);
-      await bb.sdk.threads.archive({ threadId: ws.cyril_thread_id });
+      await bb.sdk.threads.archive({ threadId: ws.ariadne_thread_id });
       store.archiveWorkstream(name);
       publish();
       return { ok: true };
@@ -827,8 +841,8 @@ export default async function plugin(bb: BbPluginApi) {
     notes: async ({ workstream }) => ({ notes: store.notes(workstream) }),
     staging: async ({ limit }) => ({ entries: store.staging(limit) }),
     thread_context: async ({ threadId }) => {
-      const ws = store.workstreamByCyril(threadId);
-      if (ws !== undefined) return { role: "cyril" as const, workstream: ws.name, taskId: null };
+      const ws = store.workstreamByAriadne(threadId);
+      if (ws !== undefined) return { role: "ariadne" as const, workstream: ws.name, taskId: null };
       const task = store.taskByWorker(threadId);
       if (task !== undefined) return { role: "worker" as const, workstream: task.workstream, taskId: task.id };
       return { role: "none" as const, workstream: null, taskId: null };
@@ -840,11 +854,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register(
     defineCli({
-      name: "cyril",
-      summary: "Cyril manager threads: workstreams, boards, notes and the staging log",
+      name: "ariadne",
+      summary: "Ariadne manager threads: workstreams, boards, notes and the staging log",
       commands: {
         create: cliCommand({
-          summary: "Create a workstream and its Cyril thread",
+          summary: "Create a workstream and its Ariadne thread",
           positionals: [{ name: "workstream", description: "Workstream name", required: true }],
           options: {
             project: { type: "string", description: "Project id (defaults to the invoking thread's project)" },
@@ -856,7 +870,7 @@ export default async function plugin(bb: BbPluginApi) {
               throw new PluginCliError("no project", { code: "missing_project", hint: "Pass --project <id> (bb project list)." });
             }
             const id = await createWorkstream(input.positionals.workstream, projectId, [input.options.link ?? []].flat());
-            return { exitCode: 0, stdout: `Created Cyril ${id} for "${input.positionals.workstream}".` };
+            return { exitCode: 0, stdout: `Created Ariadne ${id} for "${input.positionals.workstream}".` };
           },
         }),
         list: cliCommand({
@@ -865,7 +879,7 @@ export default async function plugin(bb: BbPluginApi) {
             const rows = await Promise.all(store.workstreams().map(workstreamView));
             const lines = rows.map(
               (w) =>
-                `${w.name}${w.archived ? " (archived)" : ""}  cyril=${w.cyrilThreadId}  project=${w.projectName ?? w.projectId}  running=${w.counts.running} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
+                `${w.name}${w.archived ? " (archived)" : ""}  ariadne=${w.ariadneThreadId}  project=${w.projectName ?? w.projectId}  running=${w.counts.running} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
             );
             return { exitCode: 0, stdout: lines.length === 0 ? "No workstreams." : lines.join("\n") };
           },

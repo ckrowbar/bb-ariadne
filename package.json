@@ -1,5 +1,5 @@
 {
-  "name": "bb-plugin-cyril",
+  "name": "bb-plugin-ariadne",
   "version": "0.1.0",
   "type": "module",
   "engines": {
@@ -7,10 +7,13 @@
     "bbPluginSdk": ">=0.6.15"
   },
   "bb": {
-    "name": "Cyril",
-    "description": "Cyril: a manager agent that keeps workstream knowledge and coordinates worker threads.",
+    "name": "Ariadne",
+    "description": "Ariadne: a manager agent that keeps workstream knowledge and coordinates worker threads.",
     "branding": {
-      "icon": "Users"
+      "icon": "./assets/yarn.svg",
+      "experimental_icons": {
+        "yarn": "./assets/yarn.svg"
+      }
     },
     "server": "./server.ts",
     "skills": [],
