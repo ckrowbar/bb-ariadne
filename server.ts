@@ -1,212 +1,877 @@
-// bb-plugin-cyril — spike.
+// bb-plugin-cyril — backend entry.
 //
-// Cyril is a manager thread for one workstream. It spawns worker threads,
-// hears when they go idle or fail, and receives explicit reports from them.
-// This spike exists to answer four questions before the real design:
-//
-//   1. What does BB's native parent notification look like on Cyril?
-//   2. Does plugin forwarding duplicate it?
-//   3. Can configure() give Cyril and workers different tools by metadata?
-//   4. Does threads.send({ mode: "auto" }) wake an idle Cyril?
-//
-// Every relevant event is appended to a debug log (`bb cyril debug`) so the
-// answers come from observation rather than reading docs.
+// Cyril is a manager thread per workstream. It spawns worker threads into
+// BB-managed worktrees, tracks them on a board, keeps machine-maintained notes
+// and a staging log, and hears about workers through BB's native
+// child-completed notification plus this plugin's targeted alerts.
+// Design and the findings behind it: docs/v0-spec.md.
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { PluginCliError, cliCommand, defineCli } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-
-type Role = "cyril" | "worker";
+import { CHANGED_CHANNEL, TASK_STATUSES, rpcContract, type PrSummary, type Task, type Workstream } from "./src/contract";
+import { openStore, type WorkstreamRow } from "./src/db";
+import {
+  branchExists,
+  branchIsSafeToDelete,
+  currentBranch,
+  defaultBranch,
+  deleteBranch,
+  refreshBase,
+  worktreeDirt,
+} from "./src/git";
+import { cyrilInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
 
 interface CyrilMetadata {
-  role?: Role;
+  role?: "cyril" | "worker";
   workstream?: string;
   cyrilThreadId?: string;
+  taskId?: string;
 }
 
-interface DebugEntry {
-  at: string;
-  kind: string;
-  threadId: string;
-  detail: string;
-}
-
-const DEBUG_KEY = "debug-log";
-const DEBUG_LIMIT = 200;
-
-const CYRIL_INSTRUCTIONS = [
-  "You are Cyril, the manager for one workstream. You are the user's main point of contact.",
-  "Spawn workers with the cyril_spawn_worker tool. You may spawn and steer workers without asking.",
-  "Messages starting with [cyril] come from the Cyril plugin or a worker, not the user.",
-].join("\n");
-
-const WORKER_INSTRUCTIONS = [
-  "You are a worker managed by a Cyril manager thread.",
-  "Use the cyril_report tool to tell Cyril when you open a PR, get blocked, or finish.",
-].join("\n");
+const HEARTBEAT_CRON = "*/10 * * * *";
+const PLUGIN_PREFIX = "[cyril plugin]";
 
 function text(value: string) {
   return [{ type: "text" as const, text: value, mentions: [] }];
 }
 
+function errorText(message: string) {
+  return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+function describeInteraction(interaction: unknown): string {
+  const payload = (interaction as { payload?: Record<string, unknown> }).payload ?? {};
+  const kind = typeof payload.kind === "string" ? payload.kind : "interaction";
+  const questions = Array.isArray(payload.questions) ? (payload.questions as { prompt?: string }[]) : [];
+  const prompt =
+    typeof payload.prompt === "string" ? payload.prompt : questions.map((q) => q.prompt).filter(Boolean).join("; ");
+  return prompt === "" ? kind : `${kind}: ${prompt}`;
+}
+
+function improvementKickoff(input: { problem: string; evidence?: string; proposal?: string; requestedBy: string }): string {
+  return `You are improving Cyril, the BB plugin that runs manager threads (this repo). Cyril @thread:${input.requestedBy} asked for this change on the user's behalf.
+
+## Problem
+${input.problem}
+${input.evidence ? `\n## Evidence\n${input.evidence}\n` : ""}${input.proposal ? `\n## Suggested change\n${input.proposal}\n` : ""}
+## Repo
+- server.ts (backend: tools, events, heartbeat, RPC, CLI), src/ (db, git, instructions, contract), app.tsx (UI).
+- docs/v0-spec.md is the design; update it when behaviour changes. The README records findings.
+- Plugin authoring docs: the bb-plugin-authoring skill.
+
+## Definition of done
+A draft PR in ckrowbar/bb-cyril with the change, a "## Motivation" section, and open questions listed.
+
+## Rules
+- Run npm ci if node_modules is missing. Before committing: npx tsc -p . must pass, and bb plugin build must succeed.
+- Keep the change small and focused on the problem. Match the surrounding code style.
+- Never reload, reinstall or edit the live plugin checkout; the user applies merged changes.
+- Commit on your branch, then push with: env -u GH_TOKEN -u GITHUB_TOKEN git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push -u origin HEAD
+- Open the PR with: env -u GH_TOKEN -u GITHUB_TOKEN gh pr create --draft -R ckrowbar/bb-cyril
+- Report the PR with cyril_report (status pr-opened, prUrl), then finish with cyril_report done.`;
+}
+
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    linkWorkersAsChildren: {
-      type: "boolean",
-      label: "Spawn workers as child threads of Cyril (native parent notifications)",
-      default: true,
+    workerProvider: {
+      type: "string",
+      label: "Worker provider",
+      description: "Provider id for worker threads (bb provider list).",
+      default: "claude-code",
     },
-    forwardWorkerIdle: {
-      type: "boolean",
-      label: "Forward worker idle/failed events to Cyril from the plugin",
-      default: true,
+    workerModel: {
+      type: "string",
+      label: "Worker model",
+      description: "Model for worker threads. Empty uses the provider default.",
+      default: "",
+    },
+    cyrilProvider: {
+      type: "string",
+      label: "Cyril provider",
+      default: "claude-code",
+    },
+    branchConvention: {
+      type: "string",
+      label: "Branch naming convention",
+      description: "Workers rename their branch to this before pushing, e.g. <user>/<TICKET>/<slug>. Empty keeps BB's name.",
+      default: "",
+    },
+    pluginProjectId: {
+      type: "string",
+      label: "Plugin repo project",
+      description: "BB project id for this plugin's own repo. cyril_improve spawns workers there. Empty disables cyril_improve.",
+      default: "",
+    },
+    stuckMinutes: {
+      type: "number",
+      label: "Minutes before an idle running worker counts as stuck",
+      default: 30,
+    },
+    dormantMinutes: {
+      type: "number",
+      label: "Minutes without changes before the heartbeat goes quiet",
+      default: 60,
     },
   });
-  const { linkWorkersAsChildren, forwardWorkerIdle } = await settings.get();
+  const config = await settings.get();
+  const store = openStore(bb);
 
-  async function debug(kind: string, threadId: string, detail: string) {
-    const log = (await bb.storage.kv.get<DebugEntry[]>(DEBUG_KEY)) ?? [];
-    log.push({ at: new Date().toISOString(), kind, threadId, detail });
-    await bb.storage.kv.set(DEBUG_KEY, log.slice(-DEBUG_LIMIT));
+  // Resolved once so configure() (synchronous) can name the checkout to apply updates in.
+  let pluginCheckout: string | null = null;
+  if (config.pluginProjectId !== "") {
+    void bb.sdk.projects
+      .get({ projectId: config.pluginProjectId })
+      .then((project) => {
+        pluginCheckout = (project.sources.find((s) => s.isDefault) ?? project.sources[0])?.path ?? null;
+      })
+      .catch((error: unknown) => bb.log.warn(`plugin project ${config.pluginProjectId}: ${String(error)}`));
   }
+
+  let lastActivityAt = Date.now();
+  const markActivity = () => {
+    lastActivityAt = Date.now();
+  };
+  const publish = () => bb.realtime.publish(CHANGED_CHANNEL, { at: Date.now() });
 
   async function metadataOf(threadId: string): Promise<CyrilMetadata> {
     return (await bb.sdk.threads.getPluginMetadata({ threadId })) as CyrilMetadata;
   }
 
   async function tellCyril(cyrilThreadId: string, message: string, senderThreadId?: string) {
-    const result = await bb.sdk.threads.send({
-      threadId: cyrilThreadId,
-      mode: "auto",
-      input: text(message),
-      senderThreadId,
-    });
-    await debug("sent-to-cyril", cyrilThreadId, JSON.stringify(result).slice(0, 300));
+    try {
+      await bb.sdk.threads.send({ threadId: cyrilThreadId, mode: "auto", input: text(message), senderThreadId });
+    } catch (error) {
+      bb.log.warn(`tell cyril ${cyrilThreadId} failed: ${String(error)}`);
+    }
   }
 
-  // configure() is synchronous and sees this plugin's metadata on the thread,
-  // so role-specific tools and instructions need no lookup.
-  bb.agents.configure((context) => {
-    const role = context.pluginMetadata.role;
-    if (role === "cyril") {
-      return { tools: ["cyril_spawn_worker"], skills: [], instructions: CYRIL_INSTRUCTIONS };
+  async function projectSource(projectId: string) {
+    const project = await bb.sdk.projects.get({ projectId });
+    const source = project.sources.find((s) => s.isDefault) ?? project.sources[0];
+    return {
+      name: project.name,
+      kind: project.kind,
+      remoteUrl: project.gitRemoteUrl,
+      path: source?.path ?? null,
+      hostId: source?.hostId ?? null,
+    };
+  }
+
+  const projectNames = new Map<string, string>();
+  async function projectName(projectId: string): Promise<string | null> {
+    if (!projectNames.has(projectId)) {
+      try {
+        projectNames.set(projectId, (await bb.sdk.projects.get({ projectId })).name);
+      } catch {
+        return null;
+      }
     }
-    if (role === "worker") {
-      return { tools: ["cyril_report"], skills: [], instructions: WORKER_INSTRUCTIONS };
+    return projectNames.get(projectId) ?? null;
+  }
+
+  // ---------------------------------------------------------------- actions
+
+  async function createWorkstream(name: string, projectId: string, links: string[]): Promise<string> {
+    if (store.workstream(name) !== undefined) throw new Error(`Workstream "${name}" already exists.`);
+    const source = await projectSource(projectId);
+    // Cyril reads code in the shared checkout for kickoffs; its instructions
+    // forbid editing there. Personal projects get a personal workspace.
+    const environment =
+      source.kind === "standard" && source.path !== null
+        ? ({
+            type: "host",
+            hostId: source.hostId ?? undefined,
+            workspace: { type: "unmanaged", path: source.path },
+          } as const)
+        : ({ type: "host", workspace: { type: "personal" } } as const);
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      environment,
+      title: `Cyril · ${name}`,
+      prompt: `${PLUGIN_PREFIX} You are Cyril for the workstream ${JSON.stringify(name)}. Introduce yourself in two sentences: what you can do, and that the user can hand you tickets here.`,
+      pinned: true,
+      providerId: config.cyrilProvider || undefined,
+      permissionMode: "full",
+      pluginMetadata: { role: "cyril", workstream: name },
+    });
+    store.insertWorkstream(name, thread.id, projectId, links);
+    store.event("workstream-created", thread.id, name);
+    publish();
+    return thread.id;
+  }
+
+  async function spawnWorker(
+    cyrilThreadId: string,
+    args: { title: string; prompt: string; links?: string[]; model?: string; baseBranch?: string; projectId?: string },
+  ): Promise<{ task: Task; note: string }> {
+    const ws = store.workstreamByCyril(cyrilThreadId);
+    if (ws === undefined) throw new Error("This Cyril thread has no workstream record.");
+    const projectId = args.projectId ?? ws.project_id;
+    const source = await projectSource(projectId);
+    let environment;
+    let note = "";
+    if (source.kind === "standard" && source.path !== null) {
+      const branch = args.baseBranch ?? (await defaultBranch(source.path));
+      const base = await refreshBase(source.path, source.remoteUrl, branch);
+      note = base.fresh ? `based on origin/${branch} at ${base.sha.slice(0, 12)}` : `WARNING: ${base.warning}`;
+      // An exact commit makes BB skip its own (SSH) fetch; verified 2026-10-15.
+      environment = {
+        type: "host",
+        hostId: source.hostId ?? undefined,
+        workspace: { type: "managed-worktree", baseBranch: { kind: "named", name: base.sha } },
+      } as const;
+    } else {
+      environment = { type: "host", workspace: { type: "personal" } } as const;
+    }
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      environment,
+      title: args.title,
+      prompt: args.prompt,
+      providerId: config.workerProvider || undefined,
+      model: args.model ?? (config.workerModel || undefined),
+      permissionMode: "full",
+      parentThreadId: cyrilThreadId,
+      pluginMetadata: { role: "worker", workstream: ws.name, cyrilThreadId },
+    });
+    const task = store.insertTask({
+      workstream: ws.name,
+      title: args.title,
+      links: args.links ?? [],
+      workerThreadId: thread.id,
+      environmentId: thread.environmentId,
+    });
+    await bb.sdk.threads.updatePluginMetadata({ threadId: thread.id, set: { taskId: task.id } });
+    store.event("worker-spawned", `${thread.id} ${note}`, ws.name, task.id);
+    markActivity();
+    publish();
+    return { task, note };
+  }
+
+  /** Task environments are only known once BB provisions them, after spawn returns. */
+  async function environmentIdFor(task: Task): Promise<string | null> {
+    if (task.environmentId !== null) return task.environmentId;
+    if (task.workerThreadId === null) return null;
+    const thread = await bb.sdk.threads.get({ threadId: task.workerThreadId }).catch(() => null);
+    const environmentId = thread?.environmentId ?? null;
+    if (environmentId !== null) store.updateTask(task.id, { environmentId });
+    return environmentId;
+  }
+
+  /** What would be lost if this task's worktree disappeared, or null if nothing. */
+  async function workAtRisk(task: Task): Promise<string | null> {
+    const environmentId = await environmentIdFor(task);
+    if (environmentId === null) return null;
+    const env = await bb.sdk.environments.get({ environmentId });
+    if (!env.managed || !env.isWorktree || env.path === null || env.lifecycle.phase === "destroyed") return null;
+    const dirt = await worktreeDirt(env.path);
+    if (dirt !== null) return `uncommitted changes in ${env.path}:\n${dirt}`;
+    const branch = (await currentBranch(env.path)) ?? env.branchName;
+    const baseRef = `refs/remotes/origin/${env.defaultBranch ?? "main"}`;
+    if (branch !== null && !(await branchIsSafeToDelete(env.path, branch, baseRef))) {
+      return `branch ${branch} has commits that are not pushed`;
+    }
+    return null;
+  }
+
+  /** Archives the worker; BB then retires its worktree (see retireWorkerEnvironment). */
+  async function dropTask(taskId: string): Promise<string> {
+    const task = store.task(taskId);
+    if (task === undefined) throw new Error(`No task ${taskId}.`);
+    store.updateTask(taskId, { status: "dropped" });
+    if (task.workerThreadId !== null) await bb.sdk.threads.archive({ threadId: task.workerThreadId });
+    store.event("task-dropped", "", task.workstream, taskId);
+    publish();
+    return `Dropped ${task.title}.`;
+  }
+
+  /**
+   * BB retires an archived thread's worktree on its own, about 5 minutes after
+   * archive (observed 2026-10-15). In that window, warn Cyril if work would be
+   * lost (unarchiving the worker keeps it). Otherwise queue the local branch
+   * for deletion once teardown finishes. A branch with unpushed commits is
+   * never deleted, so committed work survives in the repo either way.
+   */
+  async function retireWorkerEnvironment(task: Task) {
+    const environmentId = await environmentIdFor(task);
+    if (environmentId === null) return;
+    const env = await bb.sdk.environments.get({ environmentId });
+    if (!env.managed || !env.isWorktree || env.projectId === null) return;
+    const source = await projectSource(env.projectId);
+    if (source.path === null) return;
+    const branch =
+      env.path !== null && env.lifecycle.phase !== "destroyed" ? ((await currentBranch(env.path)) ?? env.branchName) : env.branchName;
+    const risk = await workAtRisk(task);
+    if (risk !== null) {
+      store.event("worktree-at-risk", risk, task.workstream, task.id);
+      const ws = store.workstream(task.workstream);
+      const when = env.lifecycle.retireAt === null ? "soon" : `at ${new Date(env.lifecycle.retireAt).toISOString()}`;
+      if (ws !== undefined)
+        await tellCyril(
+          ws.cyril_thread_id,
+          `${PLUGIN_PREFIX} Archived task ${task.id} (${task.title}) has ${risk}. BB removes its worktree ${when}; unarchiving @thread:${task.workerThreadId} keeps it. Tell the user now if the work matters.`,
+        );
+      if (risk.startsWith("branch")) return;
+    }
+    if (branch !== null) {
+      store.queueBranchCleanup({
+        environment_id: env.id,
+        repo_path: source.path,
+        branch,
+        base_ref: `refs/remotes/origin/${env.defaultBranch ?? "main"}`,
+      });
+    }
+    store.event("worktree-retiring", `${env.id} ${branch ?? ""}`, task.workstream, task.id);
+  }
+
+  async function processBranchCleanups() {
+    for (const row of store.pendingBranchCleanups()) {
+      try {
+        const env = await bb.sdk.environments.get({ environmentId: row.environment_id });
+        if (env.lifecycle.phase !== "destroyed") {
+          store.bumpBranchCleanup(row.environment_id);
+          if (row.attempts > 36) store.finishBranchCleanup(row.environment_id);
+          continue;
+        }
+        if (
+          (await branchExists(row.repo_path, row.branch)) &&
+          (await branchIsSafeToDelete(row.repo_path, row.branch, row.base_ref))
+        ) {
+          await deleteBranch(row.repo_path, row.branch);
+          store.event("branch-deleted", row.branch);
+        }
+        store.finishBranchCleanup(row.environment_id);
+      } catch (error) {
+        bb.log.warn(`branch cleanup ${row.branch} failed: ${String(error)}`);
+        store.bumpBranchCleanup(row.environment_id);
+      }
+    }
+  }
+
+  function prSummary(result: Awaited<ReturnType<typeof bb.sdk.environments.pullRequest>>): PrSummary | null {
+    if (result.outcome !== "available") return null;
+    const pr = result.pullRequest;
+    return {
+      number: pr.number,
+      title: pr.title,
+      url: pr.url,
+      state: pr.state,
+      attention: pr.attention,
+      checks: {
+        state: pr.checks.state,
+        passed: pr.checks.passedCount,
+        failed: pr.checks.failedCount,
+        pending: pr.checks.pendingCount,
+      },
+    };
+  }
+
+  /** Refreshes PR state for tasks with a worktree. Returns digest lines for changes. */
+  async function refreshPullRequests(tasks: Task[]): Promise<Map<string, string[]>> {
+    const lines = new Map<string, string[]>();
+    for (const task of tasks) {
+      try {
+        const environmentId = await environmentIdFor(task);
+        if (environmentId === null) continue;
+        const env = await bb.sdk.environments.get({ environmentId });
+        if (env.lifecycle.phase === "destroyed") continue;
+        const pr = prSummary(await bb.sdk.environments.pullRequest({ environmentId }));
+        const branch = env.path === null ? env.branchName : ((await currentBranch(env.path)) ?? env.branchName);
+        store.updateTask(task.id, { pr, prUrl: pr?.url ?? task.prUrl, branch });
+        if (pr === null) continue;
+        const signature = `${pr.state}|${pr.attention}|${pr.checks.state}`;
+        if (store.digestChanged(`pr:${task.id}`, signature) && (pr.checks.state === "failing" || pr.attention !== "none")) {
+          const list = lines.get(task.workstream) ?? [];
+          list.push(
+            `PR #${pr.number} for ${task.id} (${task.title}): state ${pr.state}, attention ${pr.attention}, checks ${pr.checks.state} (${pr.checks.failed} failed). ${pr.url}`,
+          );
+          lines.set(task.workstream, list);
+        }
+      } catch (error) {
+        bb.log.warn(`pr refresh ${task.id} failed: ${String(error)}`);
+      }
+    }
+    return lines;
+  }
+
+  async function heartbeat() {
+    await processBranchCleanups();
+    if (Date.now() - lastActivityAt > config.dormantMinutes * 60_000) return;
+    const active = store.activeTasks();
+    const digest = await refreshPullRequests(active);
+    const add = (workstream: string, line: string) => digest.set(workstream, [...(digest.get(workstream) ?? []), line]);
+
+    for (const task of active.filter((t) => t.status === "running" && t.workerThreadId !== null)) {
+      const thread = await bb.sdk.threads.get({ threadId: task.workerThreadId! }).catch(() => null);
+      if (thread === null || thread.status !== "idle") continue;
+      const idleMinutes = (Date.now() - thread.updatedAt) / 60_000;
+      if (idleMinutes >= config.stuckMinutes && store.digestChanged(`stuck:${task.id}`, String(thread.updatedAt))) {
+        add(task.workstream, `Worker @thread:${task.workerThreadId} (${task.id}, ${task.title}) has been idle ${Math.round(idleMinutes)} min while its task is still running.`);
+      }
+    }
+    for (const task of store.unharvestedDone()) {
+      if (store.digestChanged(`harvest:${task.id}`, String(task.updatedAt))) {
+        add(task.workstream, `Task ${task.id} (${task.title}) is done but not yet folded into notes.`);
+      }
+    }
+    const recent = store.staging(50, Date.now() - 60 * 60_000);
+    for (const entry of recent) {
+      const overlap = recent.find((o) => o.service === entry.service && o.workstream !== entry.workstream);
+      if (overlap !== undefined && store.digestChanged(`staging:${entry.id}`, String(overlap.id))) {
+        add(entry.workstream, `Staging overlap on ${entry.service}: ${entry.branch} (${entry.workstream}) and ${overlap.branch} (${overlap.workstream}) within the last hour.`);
+      }
+    }
+
+    for (const [workstream, lines] of digest) {
+      const ws = store.workstream(workstream);
+      if (ws === undefined || ws.archived_at !== null || lines.length === 0) continue;
+      await tellCyril(ws.cyril_thread_id, `${PLUGIN_PREFIX} Heartbeat digest:\n- ${lines.join("\n- ")}`);
+      markActivity();
+    }
+    if (digest.size > 0) publish();
+  }
+
+  async function workstreamView(row: WorkstreamRow): Promise<Workstream> {
+    return {
+      name: row.name,
+      cyrilThreadId: row.cyril_thread_id,
+      projectId: row.project_id,
+      projectName: await projectName(row.project_id),
+      links: store.links(row),
+      archived: row.archived_at !== null,
+      counts: store.counts(row.name),
+    };
+  }
+
+  // ------------------------------------------------------------ agent setup
+
+  // configure() is synchronous; better-sqlite3 lets it read the workstream.
+  bb.agents.configure((context) => {
+    const meta = context.pluginMetadata as CyrilMetadata;
+    if (meta.role === "cyril") {
+      const ws = store.workstreamByCyril(context.thread.id);
+      return {
+        tools: [
+          "cyril_spawn_worker",
+          "cyril_board",
+          "cyril_task_update",
+          "cyril_notes_read",
+          "cyril_notes_write",
+          "cyril_staging",
+          "cyril_lesson_add",
+          "cyril_lesson_remove",
+          ...(config.pluginProjectId === "" ? [] : ["cyril_improve"]),
+        ],
+        skills: [],
+        instructions: cyrilInstructions({
+          workstream: ws?.name ?? String(meta.workstream ?? "unknown"),
+          links: ws === undefined ? [] : store.links(ws),
+          projectName: projectNames.get(ws?.project_id ?? "") ?? context.project.name,
+          pluginCheckout,
+        }),
+      };
+    }
+    if (meta.role === "worker" && typeof meta.cyrilThreadId === "string") {
+      return {
+        tools: ["cyril_report", "cyril_staging_log"],
+        skills: [],
+        instructions: workerInstructions({
+          cyrilThreadId: meta.cyrilThreadId,
+          taskId: String(meta.taskId ?? "unknown"),
+          // The convention is for the user's work repos, not this plugin's repo.
+          branchConvention: context.project.id === config.pluginProjectId ? "" : config.branchConvention,
+        }),
+      };
     }
     return { tools: [], skills: [] };
   });
 
+  bb.agents.contributeInstructions(({ threadId }) =>
+    store.workstreamByCyril(threadId) === undefined ? null : lessonsInstructions(store.lessons()),
+  );
+
+  async function requireCyril(threadId: string): Promise<WorkstreamRow | string> {
+    const ws = store.workstreamByCyril(threadId);
+    return ws ?? "Only a Cyril thread can use this tool.";
+  }
+
   bb.agents.registerTool({
     name: "cyril_spawn_worker",
-    description: "Spawn a worker thread for one task in this workstream.",
+    description: "Spawn a worker thread for one task in its own worktree, and add the task to the board.",
+    presentation: { label: { pending: "Spawning worker", completed: "Spawned worker" } },
     parameters: z.object({
-      title: z.string().min(1).max(120),
-      prompt: z.string().min(1),
-      model: z.string().optional(),
+      title: z.string().min(1).max(120).describe("Short task title, e.g. 'CHATINTS-2414 notify on join'"),
+      prompt: z.string().min(1).describe("The full kickoff prompt for the worker"),
+      links: z.array(z.string()).max(20).optional().describe("Ticket or doc URLs for the board"),
+      model: z.string().optional().describe("Model override for this worker"),
+      baseBranch: z.string().optional().describe("Base branch to fork from; defaults to the repo default branch"),
     }),
-    async execute({ title, prompt, model }, { threadId, projectId }) {
-      const cyril = await metadataOf(threadId);
-      if (cyril.role !== "cyril") {
-        return { content: [{ type: "text", text: "Only a Cyril thread can spawn workers." }], isError: true };
-      }
-      const worker = await bb.sdk.threads.spawn({
-        projectId,
-        environment: { type: "host", workspace: { type: "personal" } },
-        title,
-        prompt,
-        model,
-        parentThreadId: linkWorkersAsChildren ? threadId : undefined,
-        pluginMetadata: { role: "worker", workstream: cyril.workstream ?? null, cyrilThreadId: threadId },
+    async execute(args, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const { task, note } = await spawnWorker(threadId, args);
+      return `Spawned worker @thread:${task.workerThreadId} for task ${task.id} (${task.title}); ${note}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_board",
+    description: "List this workstream's tasks with status, worker thread, branch and PR state.",
+    presentation: { label: { pending: "Reading board", completed: "Read board" }, suppress: true },
+    parameters: z.object({ status: z.enum(TASK_STATUSES).optional() }),
+    async execute({ status }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const tasks = store.tasks(ws.name, status);
+      if (tasks.length === 0) return "No tasks.";
+      return tasks
+        .map((t) => {
+          const pr = t.pr === null ? (t.prUrl ?? "no PR") : `PR #${t.pr.number} ${t.pr.state}, checks ${t.pr.checks.state}`;
+          return `${t.id} [${t.status}${t.harvested ? ", harvested" : ""}] ${t.title} | worker @thread:${t.workerThreadId} | ${t.branch ?? "-"} | ${pr}${t.summary ? ` | ${t.summary}` : ""}`;
+        })
+        .join("\n");
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_task_update",
+    description: "Update a task on the board.",
+    presentation: { label: { pending: "Updating task", completed: "Updated task" } },
+    parameters: z.object({
+      taskId: z.string(),
+      status: z.enum(TASK_STATUSES).optional(),
+      prUrl: z.string().optional(),
+      summary: z.string().max(2000).optional(),
+      harvested: z.boolean().optional(),
+    }),
+    async execute({ taskId, ...changes }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const task = store.task(taskId);
+      if (task === undefined || task.workstream !== ws.name) return errorText(`No task ${taskId} in this workstream.`);
+      store.updateTask(taskId, changes);
+      store.event("task-updated", JSON.stringify(changes), ws.name, taskId);
+      publish();
+      return `Updated ${taskId}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_notes_read",
+    description: "Read this workstream's notes. Omit topic to list all topics with their content.",
+    presentation: { label: { pending: "Reading notes", completed: "Read notes" }, suppress: true },
+    parameters: z.object({ topic: z.string().optional() }),
+    async execute({ topic }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const notes = store.notes(ws.name, 0).filter((n) => topic === undefined || n.topic === topic);
+      if (notes.length === 0) return topic === undefined ? "No notes yet." : `No note "${topic}".`;
+      return notes.map((n) => `## ${n.topic} (rev ${n.revision})\n${n.body}`).join("\n\n");
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_notes_write",
+    description:
+      "Replace a note topic with a new body. Previous versions are kept. Suggested topics: overview, people, architecture, conventions, gotchas.",
+    presentation: { label: { pending: "Updating notes", completed: "Updated notes" } },
+    parameters: z.object({
+      topic: z.string().min(1).max(60).regex(/^[a-z0-9-]+$/),
+      body: z.string().min(1).max(20_000),
+    }),
+    async execute({ topic, body }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const revision = store.writeNote(ws.name, topic, body, threadId);
+      publish();
+      return `Saved ${topic} (rev ${revision}).`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_staging",
+    description: "List recent staging integrations by Cyril workers across all workstreams.",
+    presentation: { label: { pending: "Reading staging log", completed: "Read staging log" }, suppress: true },
+    parameters: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+    async execute({ limit }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const entries = store.staging(limit ?? 20);
+      if (entries.length === 0) return "No staging integrations logged.";
+      return entries
+        .map((e) => `${new Date(e.at).toISOString()} ${e.service} ← ${e.branch} (${e.workstream}, @thread:${e.workerThreadId}): ${e.purpose}`)
+        .join("\n");
+    },
+  });
+
+
+  bb.agents.registerTool({
+    name: "cyril_lesson_add",
+    description:
+      "Remember a behaviour adjustment for every Cyril, e.g. a user preference or playbook tweak. Applies from each Cyril's next session.",
+    presentation: { label: { pending: "Saving lesson", completed: "Saved lesson" } },
+    parameters: z.object({ text: z.string().min(5).max(400) }),
+    async execute({ text: lesson }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      const id = store.addLesson(lesson, threadId);
+      store.event("lesson-added", lesson, ws.name);
+      publish();
+      return `Saved lesson ${id}. Follow it now; other Cyrils pick it up at their next session.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_lesson_remove",
+    description: "Remove a lesson that is wrong or stale, by id.",
+    presentation: { label: { pending: "Removing lesson", completed: "Removed lesson" } },
+    parameters: z.object({ id: z.number().int() }),
+    async execute({ id }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      if (!store.removeLesson(id)) return errorText(`No lesson ${id}.`);
+      store.event("lesson-removed", String(id), ws.name);
+      publish();
+      return `Removed lesson ${id}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "cyril_improve",
+    description:
+      "Fix or improve Cyril itself. Spawns a worker in the plugin repo that makes the change and opens a draft PR for the user to review. Nothing changes in the running plugin until the user merges and asks you to apply it.",
+    presentation: { label: { pending: "Starting a Cyril improvement", completed: "Started a Cyril improvement" } },
+    parameters: z.object({
+      title: z.string().min(1).max(100).describe("Short title, e.g. 'Show harvested state on the board'"),
+      problem: z.string().min(1).max(4000).describe("What is wrong or missing, from the user's point of view"),
+      evidence: z.string().max(8000).optional().describe("Concrete evidence: tool errors, thread ids, quotes"),
+      proposal: z.string().max(4000).optional().describe("Suggested change, if you have one"),
+    }),
+    async execute({ title, problem, evidence, proposal }, { threadId }) {
+      const ws = await requireCyril(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      if (config.pluginProjectId === "") return errorText("cyril_improve is not configured (pluginProjectId).");
+      const { task, note } = await spawnWorker(threadId, {
+        title: `Improve Cyril: ${title}`,
+        prompt: improvementKickoff({ problem, evidence, proposal, requestedBy: threadId }),
+        projectId: config.pluginProjectId,
       });
-      await debug("spawned-worker", worker.id, `cyril=${threadId} child=${linkWorkersAsChildren}`);
-      return `Spawned worker ${worker.id} (${title}).`;
+      store.event("improvement-started", title, ws.name, task.id);
+      return `Started improvement worker @thread:${task.workerThreadId} (task ${task.id}); ${note}. It will report a draft PR.`;
     },
   });
 
   bb.agents.registerTool({
     name: "cyril_report",
-    description: "Send a one-line status report to your Cyril manager thread.",
+    description: "Report to your Cyril manager: pr-opened, blocked, done or fyi.",
+    presentation: { label: { pending: "Reporting to Cyril", completed: "Reported to Cyril" } },
     parameters: z.object({
       status: z.enum(["pr-opened", "blocked", "done", "fyi"]),
-      note: z.string().min(1).max(2000),
+      note: z.string().min(1).max(4000),
+      prUrl: z.string().optional(),
     }),
-    async execute({ status, note }, { threadId }) {
-      const worker = await metadataOf(threadId);
-      if (worker.role !== "worker" || worker.cyrilThreadId === undefined) {
-        return { content: [{ type: "text", text: "This thread is not a Cyril worker." }], isError: true };
+    async execute({ status, note, prUrl }, { threadId }) {
+      const meta = await metadataOf(threadId);
+      const task = store.taskByWorker(threadId);
+      if (meta.role !== "worker" || meta.cyrilThreadId === undefined || task === undefined) {
+        return errorText("This thread is not a Cyril worker.");
       }
-      await debug("worker-report", threadId, `${status}: ${note}`);
-      await tellCyril(worker.cyrilThreadId, `[cyril] Worker ${threadId} reports ${status}: ${note}`, threadId);
+      const statusChange = { "pr-opened": "in-review", blocked: "blocked", done: "done", fyi: undefined } as const;
+      store.updateTask(task.id, {
+        status: statusChange[status],
+        prUrl: prUrl ?? undefined,
+        summary: status === "done" ? note.slice(0, 2000) : undefined,
+      });
+      store.event(`report-${status}`, note, task.workstream, task.id);
+      markActivity();
+      publish();
+      await tellCyril(
+        meta.cyrilThreadId,
+        `${PLUGIN_PREFIX} Worker @thread:${threadId} (${task.id}, ${task.title}) reports ${status}${prUrl ? ` ${prUrl}` : ""}: ${note}`,
+        threadId,
+      );
       return "Reported to Cyril.";
     },
   });
 
-  async function onWorkerLifecycle(kind: "idle" | "failed", threadId: string, originPluginId: string | null, detail: string | null) {
-    // Cheap filter first: only threads this plugin spawned can be workers.
-    if (originPluginId !== bb.pluginId) return;
-    const worker = await metadataOf(threadId);
-    if (worker.role !== "worker" || worker.cyrilThreadId === undefined) return;
-    await debug(`worker-${kind}`, threadId, (detail ?? "").slice(0, 300));
-    if (!forwardWorkerIdle) return;
-    const summary = (detail ?? "(no output)").slice(0, 1500);
-    await tellCyril(worker.cyrilThreadId, `[cyril] Worker ${threadId} is ${kind}. Last output:\n\n${summary}`);
-  }
-
-  bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
-    onWorkerLifecycle("idle", thread.id, thread.originPluginId, lastAssistantText),
-  );
-  bb.events.on("thread.failed", ({ thread, error }) =>
-    onWorkerLifecycle("failed", thread.id, thread.originPluginId, error),
-  );
-
-  // Record Cyril's own transitions so we can see whether native parent
-  // notifications or plugin sends woke it (question 1, 2 and 4).
-  bb.events.on("thread.active", async ({ thread }) => {
-    if (thread.originPluginId !== bb.pluginId) return;
-    const meta = await metadataOf(thread.id);
-    if (meta.role === "cyril") await debug("cyril-active", thread.id, "");
-  });
-
-  const usage = [
-    "Usage:",
-    "  bb cyril create <workstream> [--project <id>]",
-    "  bb cyril debug [--clear]",
-  ].join("\n");
-
-  bb.cli.register({
-    name: "cyril",
-    summary: "Create Cyril manager threads and inspect the spike debug log",
-    commands: [
-      { name: "create", summary: "Create a Cyril thread for a workstream", usage: "bb cyril create <workstream> [--project <id>]" },
-      { name: "debug", summary: "Show or clear the spike debug log", usage: "bb cyril debug [--clear]" },
-    ],
-    async run(argv, ctx) {
-      const [command, ...args] = argv;
-      if (command === "create") {
-        const projectFlag = args.indexOf("--project");
-        const projectId = projectFlag >= 0 ? args[projectFlag + 1] : ctx.projectId;
-        const workstream = args.filter((_, i) => i !== projectFlag && i !== projectFlag + 1).join(" ").trim();
-        if (workstream === "" || projectId === undefined) return { exitCode: 1, stderr: usage };
-        const thread = await bb.sdk.threads.spawn({
-          projectId,
-          environment: { type: "host", workspace: { type: "personal" } },
-          title: `Cyril · ${workstream}`,
-          prompt: `You are Cyril for the "${workstream}" workstream. Introduce yourself in one sentence and wait for instructions.`,
-          pinned: true,
-          pluginMetadata: { role: "cyril", workstream },
-        });
-        await debug("created-cyril", thread.id, workstream);
-        return { exitCode: 0, stdout: `Created Cyril ${thread.id} for "${workstream}".` };
-      }
-      if (command === "debug") {
-        if (args.includes("--clear")) {
-          await bb.storage.kv.set(DEBUG_KEY, []);
-          return { exitCode: 0, stdout: "Cleared." };
-        }
-        const log = (await bb.storage.kv.get<DebugEntry[]>(DEBUG_KEY)) ?? [];
-        const lines = log.map((e) => `${e.at}  ${e.kind.padEnd(16)} ${e.threadId}  ${e.detail}`);
-        return { exitCode: 0, stdout: lines.length === 0 ? "Empty." : lines.join("\n") };
-      }
-      return { exitCode: command === undefined || command === "help" ? 0 : 1, stdout: usage };
+  bb.agents.registerTool({
+    name: "cyril_staging_log",
+    description: "Record that you integrated a branch into staging. Call right after chat-integrate or similar.",
+    presentation: { label: { pending: "Logging staging integration", completed: "Logged staging integration" } },
+    parameters: z.object({
+      service: z.string().min(1).max(80),
+      branch: z.string().min(1).max(200),
+      purpose: z.string().min(1).max(500),
+    }),
+    async execute({ service, branch, purpose }, { threadId }) {
+      const task = store.taskByWorker(threadId);
+      if (task === undefined) return errorText("This thread is not a Cyril worker.");
+      store.logStaging({ workstream: task.workstream, workerThreadId: threadId, taskId: task.id, service, branch, purpose });
+      store.event("staging", `${service} ${branch}`, task.workstream, task.id);
+      markActivity();
+      publish();
+      return "Logged.";
     },
   });
+
+  // ----------------------------------------------------------------- events
+
+  // BB's native child-completed notification tells Cyril when a worker
+  // finishes (spike finding 1). These handlers cover what BB does not.
+  bb.events.on("interaction.pending", async ({ thread, interaction }) => {
+    if (thread.originPluginId !== bb.pluginId) return;
+    const task = store.taskByWorker(thread.id);
+    if (task === undefined) return;
+    const ws = store.workstream(task.workstream);
+    if (ws === undefined) return;
+    markActivity();
+    await tellCyril(
+      ws.cyril_thread_id,
+      `${PLUGIN_PREFIX} Worker @thread:${thread.id} (${task.id}, ${task.title}) is waiting on ${describeInteraction(interaction)}. It is stalled until someone answers in that thread.`,
+      thread.id,
+    );
+  });
+
+  bb.events.on("thread.archived", async ({ thread }) => {
+    if (thread.originPluginId !== bb.pluginId) return;
+    const ws = store.workstreamByCyril(thread.id);
+    if (ws !== undefined) {
+      store.archiveWorkstream(ws.name);
+      publish();
+      return;
+    }
+    const task = store.taskByWorker(thread.id);
+    if (task === undefined) return;
+    if (task.status === "running" || task.status === "blocked") store.updateTask(task.id, { status: "dropped" });
+    publish();
+    try {
+      await retireWorkerEnvironment(task);
+    } catch (error) {
+      bb.log.warn(`retire worktree ${task.id} failed: ${String(error)}`);
+    }
+  });
+
+  bb.events.on("thread.active", ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) markActivity();
+  });
+  bb.events.on("thread.idle", ({ thread }) => {
+    if (thread.originPluginId === bb.pluginId) markActivity();
+  });
+
+  bb.background.schedule("heartbeat", HEARTBEAT_CRON, heartbeat);
+
+  // -------------------------------------------------------------------- RPC
+
+  bb.rpc.register(rpcContract, {
+    overview: async () => ({
+      workstreams: await Promise.all(store.workstreams().map(workstreamView)),
+    }),
+    projects: async () => {
+      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      return { projects: projects.map((p) => ({ id: p.id, name: p.name, kind: p.kind })) };
+    },
+    workstream_create: async ({ name, projectId, links }) => ({
+      cyrilThreadId: await createWorkstream(name, projectId, links),
+    }),
+    workstream_archive: async ({ name }) => {
+      const ws = store.workstream(name);
+      if (ws === undefined) throw new Error(`No workstream ${name}.`);
+      await bb.sdk.threads.archive({ threadId: ws.cyril_thread_id });
+      store.archiveWorkstream(name);
+      publish();
+      return { ok: true };
+    },
+    board: async ({ workstream }) => ({ tasks: store.tasks(workstream) }),
+    task_drop_preview: async ({ taskId }) => {
+      const task = store.task(taskId);
+      return { risk: task === undefined ? null : await workAtRisk(task) };
+    },
+    task_drop: async ({ taskId }) => ({ ok: true, detail: await dropTask(taskId) }),
+    lessons: async () => ({ lessons: store.lessons() }),
+    lesson_remove: async ({ id }) => {
+      const ok = store.removeLesson(id);
+      if (ok) store.event("lesson-removed", `${id} (from UI)`);
+      publish();
+      return { ok };
+    },
+    notes: async ({ workstream }) => ({ notes: store.notes(workstream) }),
+    staging: async ({ limit }) => ({ entries: store.staging(limit) }),
+    thread_context: async ({ threadId }) => {
+      const ws = store.workstreamByCyril(threadId);
+      if (ws !== undefined) return { role: "cyril" as const, workstream: ws.name, taskId: null };
+      const task = store.taskByWorker(threadId);
+      if (task !== undefined) return { role: "worker" as const, workstream: task.workstream, taskId: task.id };
+      return { role: "none" as const, workstream: null, taskId: null };
+    },
+  });
+
+  // -------------------------------------------------------------------- CLI
+  // For agents and scripting; the user works through the UI.
+
+  bb.cli.register(
+    defineCli({
+      name: "cyril",
+      summary: "Cyril manager threads: workstreams, boards, notes and the staging log",
+      commands: {
+        create: cliCommand({
+          summary: "Create a workstream and its Cyril thread",
+          positionals: [{ name: "workstream", description: "Workstream name", required: true }],
+          options: {
+            project: { type: "string", description: "Project id (defaults to the invoking thread's project)" },
+            link: { type: "string", repeatable: true, description: "Link to attach (repeatable)" },
+          },
+          async run(input, ctx) {
+            const projectId = input.options.project ?? ctx.projectId;
+            if (projectId === undefined) {
+              throw new PluginCliError("no project", { code: "missing_project", hint: "Pass --project <id> (bb project list)." });
+            }
+            const id = await createWorkstream(input.positionals.workstream, projectId, [input.options.link ?? []].flat());
+            return { exitCode: 0, stdout: `Created Cyril ${id} for "${input.positionals.workstream}".` };
+          },
+        }),
+        list: cliCommand({
+          summary: "List workstreams",
+          async run() {
+            const rows = await Promise.all(store.workstreams().map(workstreamView));
+            const lines = rows.map(
+              (w) =>
+                `${w.name}${w.archived ? " (archived)" : ""}  cyril=${w.cyrilThreadId}  project=${w.projectName ?? w.projectId}  running=${w.counts.running} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
+            );
+            return { exitCode: 0, stdout: lines.length === 0 ? "No workstreams." : lines.join("\n") };
+          },
+        }),
+        board: cliCommand({
+          summary: "Show a workstream's tasks",
+          positionals: [{ name: "workstream", description: "Workstream name", required: true }],
+          async run(input) {
+            const tasks = store.tasks(input.positionals.workstream);
+            const lines = tasks.map(
+              (t) => `${t.id}  [${t.status}]  ${t.title}  worker=${t.workerThreadId ?? "-"}  ${t.pr?.url ?? t.prUrl ?? ""}`,
+            );
+            return { exitCode: 0, stdout: lines.length === 0 ? "No tasks." : lines.join("\n") };
+          },
+        }),
+        notes: cliCommand({
+          summary: "Show a workstream's notes",
+          positionals: [{ name: "workstream", description: "Workstream name", required: true }],
+          async run(input) {
+            const notes = store.notes(input.positionals.workstream, 0);
+            const out = notes.map((n) => `## ${n.topic} (rev ${n.revision})\n${n.body}`).join("\n\n");
+            return { exitCode: 0, stdout: out === "" ? "No notes." : out };
+          },
+        }),
+        staging: cliCommand({
+          summary: "Show recent staging integrations",
+          options: { limit: { type: "integer", min: 1, max: 200, description: "Rows to show (1-200)", default: 20 } },
+          async run(input) {
+            const entries = store.staging(Number(input.options.limit ?? 20));
+            const lines = entries.map(
+              (e) => `${new Date(e.at).toISOString()}  ${e.service}  ${e.branch}  ${e.workstream}  ${e.purpose}`,
+            );
+            return { exitCode: 0, stdout: lines.length === 0 ? "No entries." : lines.join("\n") };
+          },
+        }),
+      },
+    }),
+  );
 }
