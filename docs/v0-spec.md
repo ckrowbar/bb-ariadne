@@ -92,10 +92,10 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
   uses SSH, and SSH only works while the user's laptop forwards its agent, so
   provisioning failed. A local base (`--base-branch main`) skips the fetch, but
   local `main` was 24 hours old.
-  - Plan: before each spawn, the plugin refreshes `origin/main` over
-    token-authenticated HTTPS (the same path the workspace commit helper uses)
-    and passes the resulting commit as the base. To verify: that BB accepts a
-    commit SHA as the base without fetching.
+  - Fix (built, verified): before each spawn, the plugin fetches the base
+    branch over token-authenticated HTTPS (ddtool for Datadog orgs, stored gh
+    credentials otherwise) and passes the resulting commit as the base. BB
+    accepts a commit SHA without fetching. The e2e worker's base was 86 s old.
 - **Branch names.** BB names the branch `bb/<title-slug>-<thread-id>`. A worker
   can `git branch -m` to the user's convention; BB shows the new name after its
   next status refresh.
@@ -104,7 +104,15 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
   need SSH.
 - **Cost.** Checking out dd-source took 51 s. Teardown took about 2 min.
 - **Teardown leaves local branches.** The plugin deletes a worker's local
-  branch after teardown only if the branch matches its upstream.
+  branch after teardown only if every commit on it is already upstream.
+- **BB retires archived worktrees itself.** Archiving a thread puts its
+  environment in `retiring` with a deadline about 5 minutes out, then BB tears
+  it down, whatever its state. So the plugin cannot keep a worktree. It warns
+  Cyril during that window when work is at risk (unarchiving keeps it), and the
+  Drop dialog shows the risk before you confirm.
+- **Environment ids arrive late.** `threads.spawn` returns before provisioning,
+  so `environmentId` is null at spawn. The plugin resolves it from the thread
+  when it first needs it.
 - **Questions are clickable.** Claude Code's question tool became a
   `question` interaction with options. A question asked while another
   interaction is pending fails, so the worker has to ask again.
@@ -119,9 +127,14 @@ tasks(id PRIMARY KEY, workstream, title, links_json, worker_thread_id,
       environment_id, status, pr_url, summary, harvested, updated_at)
 staging_log(id PRIMARY KEY, at, worker_thread_id, task_id, service, branch, purpose)
 events(id PRIMARY KEY, at, workstream, task_id, kind, detail)  -- audit trail
+lessons(id PRIMARY KEY, text, source_thread_id, created_at)    -- global
+branch_cleanup(environment_id PRIMARY KEY, repo_path, branch, base_ref, attempts, requested_at)
+digest_state(key PRIMARY KEY, signature, updated_at)          -- heartbeat dedupe
 ```
 
-Task `status`: `running`, `blocked`, `in-review`, `done`, `dropped`.
+Task `status`: `running`, `blocked`, `in-review`, `done`, `dropped`. A worker's
+`done` report keeps the task `in-review` while its PR is open; the heartbeat
+moves it to `done` when the PR merges.
 
 Notes are written only by machines (Cyril and the plugin). Every write keeps
 the previous revision, so a bad update can be rolled back. Suggested starting
@@ -141,6 +154,8 @@ the spike).
 | `cyril_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
 | `cyril_notes_read(topic?)` / `cyril_notes_write(topic, body)` | Reads or replaces a note topic |
 | `cyril_staging(limit?)` | Lists recent staging log entries across all workstreams |
+| `cyril_lesson_add(text)` / `cyril_lesson_remove(id)` | Saves or removes a global lesson (see Self-improvement) |
+| `cyril_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo (see Self-improvement) |
 
 **Worker threads**
 
@@ -159,19 +174,47 @@ kickoff prompt.
 | --- | --- |
 | BB `child-completed` | Nothing. BB delivers it to Cyril natively (spike finding 1) |
 | `interaction.pending` on a worker | Tells Cyril at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
-| `thread.archived` / `thread.deleted` on a worker | Marks the task `dropped` if still `running` |
+| `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Cyril if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
+| `thread.archived` on a Cyril thread | Marks the workstream archived |
 
 **Heartbeat.** A plugin timer that looks for things nobody reports. The checks
 are plain code and cost no model turns:
 
 - workers idle with task status `running` for over 30 minutes
-- PR changes for worktree workers: checks failing, conflicts, merged
+- PR changes for worktree workers: checks failing, conflicts, merged (merged
+  moves an `in-review` task to `done`)
+- pending branch cleanups (this runs even while the heartbeat is quiet)
 - `done` tasks not yet harvested into notes
 - staging log entries from different workstreams in the same hour, for the same service
 
 It sends Cyril one digest only when something changed. It ticks every 10
 minutes while there is activity and stops after 60 minutes with no changes.
 Any spawn, worker report or worker lifecycle event restarts it.
+
+## Self-improvement
+
+The user can ask Cyril to fix or improve itself, and Cyril suggests it when a
+problem is clearly its own. There are two paths:
+
+- **Lessons**, for behaviour that remembering can fix (a preference, a
+  playbook tweak). `cyril_lesson_add` stores a global lesson. Every Cyril
+  receives lessons through `contributeInstructions`, which has its own
+  4096-character budget, so lessons never push the standing orders past BB's
+  cap. A live session keeps its instructions, so other Cyrils pick a lesson up
+  at their next session. Lessons are listed, and removable, on the Cyril page.
+- **Code**, for anything else. `cyril_improve` spawns a worker in a managed
+  worktree of the plugin repo (BB project set by the `pluginProjectId` setting;
+  `.bb-env-setup.sh` runs `npm ci`). The worker typechecks, builds, pushes a
+  branch and opens a draft PR in `ckrowbar/bb-cyril`. It never touches the
+  live plugin checkout.
+- **Applying.** Nothing changes until the user merges and asks Cyril to apply
+  it. Cyril then pulls the checkout, runs `npm ci` if the lockfile changed,
+  builds and reloads the plugin. A reviewed PR is the guard against Cyril
+  widening its own permissions.
+
+Verified 2026-10-15: lesson 1 (Haiku for throwaway tasks) was followed on the
+next spawn, and an improvement request produced
+[ckrowbar/bb-cyril#1](https://github.com/ckrowbar/bb-cyril/pull/1).
 
 ## UI
 
@@ -189,7 +232,8 @@ open threads through BB navigation.
 | Unstick a worker waiting on approval | Cyril's alert links the worker thread. BB's native approve or deny controls are there |
 | Check what Cyril knows | **Notes** tab: read-only topics with revision history |
 | See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
-| Drop a task | **Drop** on the board row. Archives the worker thread and marks the task `dropped` |
+| Drop a task | **Drop** on the board row. The dialog shows uncommitted or unpushed work first. Archives the worker thread and marks the task `dropped` |
+| Review what Cyril has learned | **Lessons** list on the Cyril page, with **Remove** |
 | Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
 | Retire a workstream | **Archive** on the workstream page. Archives the Cyril thread and its workers |
 

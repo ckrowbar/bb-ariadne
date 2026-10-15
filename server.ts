@@ -379,6 +379,7 @@ export default async function plugin(bb: BbPluginApi) {
         const branch = env.path === null ? env.branchName : ((await currentBranch(env.path)) ?? env.branchName);
         store.updateTask(task.id, { pr, prUrl: pr?.url ?? task.prUrl, branch });
         if (pr === null) continue;
+        if (pr.state === "merged" && task.status === "in-review") store.updateTask(task.id, { status: "done" });
         const signature = `${pr.state}|${pr.attention}|${pr.checks.state}`;
         if (store.digestChanged(`pr:${task.id}`, signature) && (pr.checks.state === "failing" || pr.attention !== "none")) {
           const list = lines.get(task.workstream) ?? [];
@@ -677,8 +678,10 @@ export default async function plugin(bb: BbPluginApi) {
         return errorText("This thread is not a Cyril worker.");
       }
       const statusChange = { "pr-opened": "in-review", blocked: "blocked", done: "done", fyi: undefined } as const;
+      // "done" with an unmerged PR still needs the user's review, so keep it visible.
+      const hasOpenPr = (prUrl ?? task.prUrl) !== null && task.pr?.state !== "merged";
       store.updateTask(task.id, {
-        status: statusChange[status],
+        status: status === "done" && hasOpenPr ? "in-review" : statusChange[status],
         prUrl: prUrl ?? undefined,
         summary: status === "done" ? note.slice(0, 2000) : undefined,
       });
@@ -749,6 +752,13 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       bb.log.warn(`retire worktree ${task.id} failed: ${String(error)}`);
     }
+  });
+
+  bb.events.on("thread.unarchived", ({ thread }) => {
+    const ws = store.workstreamByCyril(thread.id);
+    if (ws === undefined || ws.archived_at === null) return;
+    store.unarchiveWorkstream(ws.name);
+    publish();
   });
 
   bb.events.on("thread.active", ({ thread }) => {

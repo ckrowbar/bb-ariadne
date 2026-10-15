@@ -4,20 +4,34 @@ Cyril is a manager agent for BB. Each Cyril thread owns one workstream: it
 keeps the workstream's knowledge, spawns and steers worker threads, and is the
 main thread the user talks to.
 
-This repo currently holds a **spike**: throwaway code written to check how BB
-behaves before committing to a design.
+Design: [docs/v0-spec.md](docs/v0-spec.md).
 
-## Try it
+## Use it
+
+Everything you need is in the BB app:
+
+- **Cyril** in the sidebar: create a workstream, open its Cyril thread, and
+  see each workstream's board, notes and staging log. Lessons Cyril has
+  learned are listed there too.
+- **Cyril board** in a thread's panel launcher: the board beside the chat.
+- The home page lists active workstreams with task counts.
+
+Hand Cyril tickets in its pinned thread. Ask it to fix or improve itself when
+something is off; code changes arrive as draft PRs in this repo, and Cyril
+applies them after you merge and ask.
+
+## Install
 
 ```
+npm ci
 bb plugin install . --yes
-bb cyril create <workstream> --project <project-id>
-bb cyril debug            # every event the plugin observed
+bb plugin config cyril set pluginProjectId <BB project id of this repo>
+bb plugin config cyril set branchConvention '<user>/<TICKET>/<short-slug>'
+bb plugin reload cyril
 ```
 
-Cyril threads get the `cyril_spawn_worker` tool. Workers it spawns get the
-`cyril_report` tool. Two settings (`bb plugin config cyril`) switch between
-spawning workers as child threads and forwarding worker idle/failed events.
+Run `bb plugin config cyril` for all settings. The `bb cyril` CLI exists for
+agents and scripts.
 
 ## Spike findings (2026-10-15)
 

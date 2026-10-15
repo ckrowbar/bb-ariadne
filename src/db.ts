@@ -168,6 +168,9 @@ export function openStore(bb: BbPluginApi) {
     archiveWorkstream(name: string) {
       db.prepare("UPDATE workstreams SET archived_at = ? WHERE name = ? AND archived_at IS NULL").run(Date.now(), name);
     },
+    unarchiveWorkstream(name: string) {
+      db.prepare("UPDATE workstreams SET archived_at = NULL WHERE name = ?").run(name);
+    },
     links(row: WorkstreamRow): string[] {
       return parseLinks(row.links_json);
     },
