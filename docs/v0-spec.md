@@ -239,10 +239,17 @@ open threads through BB navigation.
 | Drop a task | **Drop** on the board row. The dialog shows uncommitted or unpushed work first. Archives the worker thread and marks the task `dropped` |
 | Review what Ariadne has learned | **Lessons** list on the Ariadne page, with **Remove** |
 | Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
-| Retire a workstream | **Archive** on the workstream page. Archives the Ariadne thread and its workers |
+| Retire a workstream | **Archive** on the workstream page. Archives the Ariadne thread and its workers. Archiving or deleting the Ariadne thread in BB also archives the workstream; the heartbeat catches deletes the plugin missed |
 
 Data reaches the UI through plugin RPC, and a realtime signal refreshes open
 views when the board, notes or staging log change.
+
+A workstream page's route is the Ariadne panel plus the workstream name as
+`subPath`. BB encodes the name in the URL and hands the page the encoded
+remainder, so the page decodes it once. Names with spaces or other special
+characters open the right page. An unknown name shows "No workstream named …",
+and a workstream with no tasks, notes or staging entries shows an empty state
+in each tab.
 
 Later, if useful: a status chip in the Ariadne thread header
 (`experimental_threadHeaderAction`) and `#task` mentions in the composer

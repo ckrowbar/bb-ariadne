@@ -19,6 +19,7 @@ import {
 import type { PluginThreadPanelProps } from "@get-bb/plugin-sdk/app";
 import type { Note, StagingEntry, Task, Workstream, rpcContract } from "./src/contract";
 import { CHANGED_CHANNEL, type TaskStatus } from "./src/constants";
+import { workstreamFromSubPath } from "./src/route";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -358,7 +359,7 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
           </DialogHeader>
           <label className="block space-y-1 text-sm">
             <span className="font-medium">Name</span>
-            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="chat-store" autoFocus />
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. my-feature" autoFocus />
           </label>
           <label className="block space-y-1 text-sm">
             <span className="font-medium">Project</span>
@@ -477,7 +478,7 @@ function WorkstreamList() {
                 <button
                   type="button"
                   className="min-w-0 flex-1 text-left"
-                  onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: encodeURIComponent(ws.name) })}
+                  onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: ws.name })}
                 >
                   <span className="font-medium hover:underline">{ws.name}</span>
                   <span className="ml-2 text-xs text-muted-foreground">
@@ -510,7 +511,7 @@ type Tab = "board" | "notes" | "staging";
 function WorkstreamDetail({ name }: { name: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const { data } = useLive(() => rpc.call("overview", null), [rpc]);
+  const { data, error } = useLive(() => rpc.call("overview", null), [rpc]);
   const [tab, setTab] = useState<Tab>("board");
   const [archiving, setArchiving] = useState(false);
   const ws = data?.workstreams.find((w) => w.name === name) ?? null;
@@ -546,26 +547,35 @@ function WorkstreamDetail({ name }: { name: string }) {
           ))}
         </p>
       ) : null}
-      <div role="tablist" className="mt-4 flex gap-1 border-b border-border">
-        {(["board", "notes", "staging"] as const).map((t) => (
-          <button
-            key={t}
-            role="tab"
-            type="button"
-            aria-selected={tab === t}
-            onClick={() => setTab(t)}
-            className={cn(
-              "-mb-px border-b-2 px-3 py-1.5 text-sm capitalize",
-              tab === t ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground",
-            )}
-          >
-            {t}
-          </button>
-        ))}
-      </div>
-      <div className="mt-4">
-        {tab === "board" ? <BoardTable workstream={name} /> : tab === "notes" ? <NotesView workstream={name} /> : <StagingView />}
-      </div>
+      <ErrorLine error={error} />
+      {data !== null && ws === null ? (
+        <div className="mt-4">
+          <EmptyState>No workstream named “{name}”.</EmptyState>
+        </div>
+      ) : (
+        <>
+          <div role="tablist" className="mt-4 flex gap-1 border-b border-border">
+            {(["board", "notes", "staging"] as const).map((t) => (
+              <button
+                key={t}
+                role="tab"
+                type="button"
+                aria-selected={tab === t}
+                onClick={() => setTab(t)}
+                className={cn(
+                  "-mb-px border-b-2 px-3 py-1.5 text-sm capitalize",
+                  tab === t ? "border-foreground font-medium" : "border-transparent text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            {tab === "board" ? <BoardTable workstream={name} /> : tab === "notes" ? <NotesView workstream={name} /> : <StagingView />}
+          </div>
+        </>
+      )}
       <Dialog open={archiving} onOpenChange={setArchiving}>
         <DialogContent>
           <DialogHeader>
@@ -595,7 +605,7 @@ function WorkstreamDetail({ name }: { name: string }) {
 }
 
 function AriadnePage({ subPath }: { subPath: string }) {
-  const name = subPath === "" ? null : decodeURIComponent(subPath.split("/")[0]!);
+  const name = workstreamFromSubPath(subPath);
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-3xl px-4 pb-4 pt-3 md:px-5 md:pt-4">
@@ -631,7 +641,7 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: encodeURIComponent(data.workstream!) })}
+          onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: data.workstream! })}
         >
           Full page
         </Button>
@@ -654,7 +664,7 @@ function HomeSection() {
           <button
             type="button"
             className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
-            onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: encodeURIComponent(ws.name) })}
+            onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: ws.name })}
           >
             {ws.name}
           </button>

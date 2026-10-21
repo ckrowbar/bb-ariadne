@@ -431,8 +431,24 @@ export default async function plugin(bb: BbPluginApi) {
     return lines;
   }
 
+  // Catches Ariadne threads deleted while the plugin was not listening for
+  // thread.deleted. Only a confirmed 404 counts; other errors may be transient.
+  async function archiveOrphanedWorkstreams() {
+    for (const ws of store.workstreams().filter((w) => w.archived_at === null)) {
+      const gone = await bb.sdk.threads.get({ threadId: ws.ariadne_thread_id }).then(
+        (thread) => thread.deletedAt !== null,
+        (error: unknown) => /\b404\b|not found/i.test(String(error)),
+      );
+      if (!gone) continue;
+      store.archiveWorkstream(ws.name);
+      store.event("workstream-orphaned", ws.ariadne_thread_id, ws.name);
+      publish();
+    }
+  }
+
   async function heartbeat() {
     await processBranchCleanups();
+    await archiveOrphanedWorkstreams();
     if (Date.now() - lastActivityAt > config.dormantMinutes * 60_000) return;
     const active = store.activeTasks();
     const digest = await refreshPullRequests(active);
@@ -770,7 +786,9 @@ export default async function plugin(bb: BbPluginApi) {
     );
   });
 
-  bb.events.on("thread.archived", async ({ thread }) => {
+  // A deleted thread is retired like an archived one; otherwise its workstream
+  // stays listed and Open Ariadne fails to load the thread.
+  async function onThreadRetired({ thread }: { thread: { id: string; originPluginId: string | null } }) {
     if (thread.originPluginId !== bb.pluginId) return;
     const ws = store.workstreamByAriadne(thread.id);
     if (ws !== undefined) {
@@ -787,7 +805,9 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       bb.log.warn(`retire worktree ${task.id} failed: ${String(error)}`);
     }
-  });
+  }
+  bb.events.on("thread.archived", onThreadRetired);
+  bb.events.on("thread.deleted", onThreadRetired);
 
   bb.events.on("thread.unarchived", ({ thread }) => {
     const ws = store.workstreamByAriadne(thread.id);
