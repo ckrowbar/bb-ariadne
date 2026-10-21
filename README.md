@@ -90,3 +90,24 @@ thread. Ariadne replied to each.
 The plugin now rejects a completion that repeats a report or answers the
 user directly. If rejection turns out noisy, the fallback is to drop the
 `done` relay in `ariadne_report` and keep only BB's completion.
+
+## Quieter plugin messages (2026-10-21)
+
+The Ariadne thread showed every heartbeat digest and worker report as a
+message bubble, and Ariadne answered each with "Nothing new."
+
+1. **Agent-only input hides a message but still starts a turn.**
+   `threads.send` accepts `visibility: "agent-only"` on each input part. BB
+   skips input groups with no visible part when it builds the transcript
+   (`buildClientUserMessagesForInputGroups` in BB's server bundle), with or
+   without `senderThreadId`. BB's own provider retry uses this for its
+   "Please continue." turn. All `tellAriadne` messages now use it.
+2. **The repeated digest was a draft PR.** The digest skipped only attention
+   `none`, so a draft PR (attention `draft`) was reported, and again after
+   each flip through `checks_pending`. Draft, checks-pending and queued PRs
+   are now quiet.
+3. **I found no other quiet channel that wakes Ariadne.** The send schema has no
+   message kind or collapsed rendering beyond agent-only. The
+   SDK's other levers are `bb.ui` surfaces and thread titles, which do not
+   wake Ariadne. Not verified in the UI: whether BB shows anything for a turn
+   that ends with no text.
