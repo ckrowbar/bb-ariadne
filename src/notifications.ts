@@ -35,3 +35,12 @@ export class WorkerTurns {
     this.turns.delete(workerThreadId);
   }
 }
+
+// PR attention states that need nobody: the worker already reported the PR,
+// and these change often (a draft flips through checks_pending as CI starts).
+const QUIET_PR_ATTENTION = new Set(["none", "draft", "checks_pending", "queued"]);
+
+/** Whether a PR change is worth a heartbeat digest line. */
+export function prNeedsAttention(pr: { attention: string; checks: { state: string } }): boolean {
+  return pr.checks.state === "failing" || !QUIET_PR_ATTENTION.has(pr.attention);
+}

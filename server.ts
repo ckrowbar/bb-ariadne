@@ -23,7 +23,7 @@ import {
   worktreeDirt,
 } from "./src/git";
 import { ariadneInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
-import { WorkerTurns, completedWorkerId } from "./src/notifications";
+import { WorkerTurns, completedWorkerId, prNeedsAttention } from "./src/notifications";
 
 interface AriadneMetadata {
   role?: "ariadne" | "worker";
@@ -39,10 +39,6 @@ const HEARTBEAT_CRON = "*/10 * * * *";
 const ARIADNE_MARK = "🧶";
 const WORKER_MARK = "🧵";
 const PLUGIN_PREFIX = "[ariadne plugin]";
-
-function text(value: string) {
-  return [{ type: "text" as const, text: value, mentions: [] }];
-}
 
 function errorText(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
@@ -153,9 +149,15 @@ export default async function plugin(bb: BbPluginApi) {
     return (await bb.sdk.threads.getPluginMetadata({ threadId })) as AriadneMetadata;
   }
 
+  /**
+   * Wakes Ariadne without showing the message in its thread. BB drops input
+   * marked agent-only from the transcript (as its own provider retries do), so
+   * the user sees only Ariadne's reply, if any. The board keeps the record.
+   */
   async function tellAriadne(ariadneThreadId: string, message: string, senderThreadId?: string) {
     try {
-      await bb.sdk.threads.send({ threadId: ariadneThreadId, mode: "auto", input: text(message), senderThreadId });
+      const input = [{ type: "text" as const, text: message, mentions: [], visibility: "agent-only" as const }];
+      await bb.sdk.threads.send({ threadId: ariadneThreadId, mode: "auto", input, senderThreadId });
     } catch (error) {
       bb.log.warn(`tell ariadne ${ariadneThreadId} failed: ${String(error)}`);
     }
@@ -419,7 +421,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (pr === null) continue;
         if (pr.state === "merged" && task.status === "in-review") store.updateTask(task.id, { status: "done" });
         const signature = `${pr.state}|${pr.attention}|${pr.checks.state}`;
-        if (store.digestChanged(`pr:${task.id}`, signature) && (pr.checks.state === "failing" || pr.attention !== "none")) {
+        if (store.digestChanged(`pr:${task.id}`, signature) && prNeedsAttention(pr)) {
           const list = lines.get(task.workstream) ?? [];
           list.push(
             `PR #${pr.number} for ${task.id} (${task.title}): state ${pr.state}, attention ${pr.attention}, checks ${pr.checks.state} (${pr.checks.failed} failed). ${pr.url}`,
@@ -461,7 +463,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (thread === null || thread.status !== "idle") continue;
       const idleMinutes = (Date.now() - thread.updatedAt) / 60_000;
       if (idleMinutes >= config.stuckMinutes && store.digestChanged(`stuck:${task.id}`, String(thread.updatedAt))) {
-        add(task.workstream, `Worker @thread:${task.workerThreadId} (${task.id}, ${task.title}) has been idle ${Math.round(idleMinutes)} min while its task is still running.`);
+        add(task.workstream, `Worker @thread:${task.workerThreadId} (${task.id}) has been idle ${Math.round(idleMinutes)} min while its task is still running.`);
       }
     }
     for (const task of store.unharvestedDone()) {
@@ -743,7 +745,7 @@ export default async function plugin(bb: BbPluginApi) {
       publish();
       await tellAriadne(
         meta.ariadneThreadId,
-        `${PLUGIN_PREFIX} Worker @thread:${threadId} (${task.id}, ${task.title}) reports ${status}${prUrl ? ` ${prUrl}` : ""}: ${note}`,
+        `${PLUGIN_PREFIX} Worker @thread:${threadId} (${task.id}) reports ${status}${prUrl ? ` ${prUrl}` : ""}: ${note}`,
         threadId,
       );
       return "Reported to Ariadne.";
@@ -820,7 +822,7 @@ export default async function plugin(bb: BbPluginApi) {
     markActivity();
     await tellAriadne(
       ws.ariadne_thread_id,
-      `${PLUGIN_PREFIX} Worker @thread:${thread.id} (${task.id}, ${task.title}) is waiting on ${describeInteraction(interaction)}. It is stalled until someone answers in that thread.`,
+      `${PLUGIN_PREFIX} Worker @thread:${thread.id} (${task.id}) is waiting on ${describeInteraction(interaction)}. It is stalled until someone answers in that thread.`,
       thread.id,
     );
   });

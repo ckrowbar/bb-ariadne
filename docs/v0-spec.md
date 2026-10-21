@@ -51,8 +51,12 @@ with", so injected state would go stale.
   report or answers a question the user asked the worker directly.
 - **Worker reports `blocked`.** Answer from notes and steer the worker if
   possible. Otherwise escalate.
-- **Heartbeat digest arrives.** Act on each item. Stay silent if nothing needs
-  the user.
+- **Plugin message arrives** (digest, worker report, stalled worker). Act on
+  each item. If nothing needs the user, end the turn with no text.
+
+Plugin messages are sent as agent-only input, so they wake Ariadne but do not
+appear in its thread. The user sees only Ariadne's replies; the board's event
+log keeps the record.
 
 ### Escalate to the user when
 
@@ -185,8 +189,9 @@ kickoff prompt.
 are plain code and cost no model turns:
 
 - workers idle with task status `running` for over 30 minutes
-- PR changes for worktree workers: checks failing, conflicts, merged (merged
-  moves an `in-review` task to `done`)
+- PR changes for worktree workers: checks failing, conflicts, review
+  changes, merged (merged moves an `in-review` task to `done`). Draft,
+  checks-pending and queued PRs are quiet; the worker already reported the PR
 - pending branch cleanups (this runs even while the heartbeat is quiet)
 - `done` tasks not yet harvested into notes
 - staging log entries from different workstreams in the same hour, for the same service
