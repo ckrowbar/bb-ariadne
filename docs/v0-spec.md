@@ -45,9 +45,10 @@ with", so injected state would go stale.
   board for overlapping in-flight tasks. Write a kickoff: goal and definition
   of done, context from notes, constraints, siblings in flight. Spawn the
   worker. Tell the user in one line.
-- **`child-completed` arrives.** Read the output. Update the task. Fold durable
-  facts into notes and mark the task harvested. Summarise for the user only
-  what they need to act on.
+- **`child-completed` or a `done` report arrives.** Read the output. Update the
+  task. Fold durable facts into notes and mark the task harvested. Summarise
+  for the user only what they need to act on. Stay silent when it repeats a
+  report or answers a question the user asked the worker directly.
 - **Worker reports `blocked`.** Answer from notes and steer the worker if
   possible. Otherwise escalate.
 - **Heartbeat digest arrives.** Act on each item. Stay silent if nothing needs
@@ -175,7 +176,7 @@ kickoff prompt.
 
 | Source | Plugin does |
 | --- | --- |
-| BB `child-completed` | Nothing. BB delivers it to Ariadne natively (spike finding 1) |
+| BB `child-completed` | BB delivers it to Ariadne natively (spike finding 1). A `message.dispatch` hook rejects it when the worker sent a `pr-opened`, `blocked` or `done` report during that turn, or when the user started the turn in the worker thread. Ariadne then gets one message per event. A steer from Ariadne into the running turn clears both, so Ariadne gets the answer it asked for |
 | `interaction.pending` on a worker | Tells Ariadne at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
 | `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Ariadne if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
 | `thread.archived` on a Ariadne thread | Marks the workstream archived |
@@ -278,3 +279,15 @@ bb ariadne staging [--limit <n>]
 ## Open questions
 
 1. Is a 30-minute idle threshold right for "stuck worker"?
+2. What does BB do with a rejected `child-completed`? The hook docs say a
+   rejected dispatch shows its message to the user and returns 409 to the
+   caller. The caller here is BB's own notifier, so it is unverified whether
+   the message shows anywhere, whether BB retries, or whether it marks the
+   worker. If it surfaces as noise, switch to a different channel (see the
+   README findings).
+3. Turn tracking lives in memory. After a plugin reload the first completion
+   per worker goes through as before, so Ariadne may see one duplicate.
+4. The hook treats a worker turn as user-started when it has
+   `initiator: user`, no sender and no `origin`. The logs confirm the first
+   two for a message typed in the worker thread; `origin` comes from the SDK
+   docs. If the app sets an `origin`, those completions go through as before.

@@ -63,3 +63,30 @@ tools, called `ariadne_report`, and finished.
   notification. Drop the plugin's idle forwarding.
 - Keep explicit worker reports (`ariadne_report`) for mid-turn events that BB
   cannot see, such as a PR opening or a blocker. Always pass `senderThreadId`.
+
+## Duplicate completion findings (2026-10-21)
+
+Worker thr_95a8u33hn7 sent Ariadne a `pr-opened` report, a `done` report, a
+`child-completed` that repeated the `done` report, and a second
+`child-completed` that answered a question the user typed in the worker
+thread. Ariadne replied to each.
+
+1. **No spawn or thread setting turns the notice off.** The spawn request has
+   `parentThreadId` and `lifecycleOwnerThreadId`, but nothing about
+   notifications. Dropping `parentThreadId` would stop the notice entirely,
+   and with it BB's failure and interruption notices.
+2. **The `message.dispatch` hook sees the notice.** It arrives with
+   `initiator: system`, no `senderThreadId`, and text
+   `[bb system] @thread:<id> completed:`. The hook context has no
+   `systemMessageKind`, so the plugin matches the text. The pass runs before
+   BB queues anything, so it runs as the worker's turn ends.
+3. **The hook also sees who starts a worker turn.** A message the user types
+   in the worker thread has `initiator: user`, no sender and no `origin`.
+   Ariadne's `bb thread tell` has `initiator: agent` and Ariadne as sender.
+   The plugin's spawn prompt also has `initiator: user` and no sender. The
+   SDK docs say its `origin` is set (`plugin`) while follow-ups have none;
+   this was not observed directly.
+
+The plugin now rejects a completion that repeats a report or answers the
+user directly. If rejection turns out noisy, the fallback is to drop the
+`done` relay in `ariadne_report` and keep only BB's completion.
