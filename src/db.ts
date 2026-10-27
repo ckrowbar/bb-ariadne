@@ -171,6 +171,22 @@ export function openStore(bb: BbPluginApi) {
     unarchiveWorkstream(name: string) {
       db.prepare("UPDATE workstreams SET archived_at = NULL WHERE name = ?").run(name);
     },
+    /**
+     * Removes a workstream and everything scoped to it. The staging log stays:
+     * it records what is on shared staging, which deleting does not undo.
+     * Pending branch cleanups stay so worker branches are still tidied.
+     */
+    deleteWorkstream(name: string) {
+      db.transaction(() => {
+        const tasks = db.prepare("SELECT id FROM tasks WHERE workstream = ?").all(name) as { id: string }[];
+        const digest = db.prepare("DELETE FROM digest_state WHERE key IN (?, ?, ?)");
+        for (const { id } of tasks) digest.run(`pr:${id}`, `stuck:${id}`, `harvest:${id}`);
+        for (const table of ["tasks", "notes", "note_revisions", "events"]) {
+          db.prepare(`DELETE FROM ${table} WHERE workstream = ?`).run(name);
+        }
+        db.prepare("DELETE FROM workstreams WHERE name = ?").run(name);
+      })();
+    },
     links(row: WorkstreamRow): string[] {
       return parseLinks(row.links_json);
     },

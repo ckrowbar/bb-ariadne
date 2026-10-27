@@ -83,6 +83,14 @@ const lessonSchema = z.object({
 });
 export type Lesson = z.infer<typeof lessonSchema>;
 
+const deletionPreviewSchema = z.object({
+  tasks: z.number(),
+  notes: z.number(),
+  liveWorkers: z.number(),
+  risks: z.array(z.object({ taskId: z.string(), title: z.string(), risk: z.string() })),
+});
+export type DeletionPreview = z.infer<typeof deletionPreviewSchema>;
+
 export const rpcContract = defineRpcContract({
   overview: {
     input: z.null(),
@@ -105,6 +113,14 @@ export const rpcContract = defineRpcContract({
   workstream_archive: {
     input: z.object({ name: z.string() }),
     output: z.object({ ok: z.boolean() }),
+  },
+  workstream_delete_preview: {
+    input: z.object({ name: z.string() }),
+    output: deletionPreviewSchema,
+  },
+  workstream_delete: {
+    input: z.object({ name: z.string() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
   },
   board: {
     input: z.object({ workstream: z.string() }),

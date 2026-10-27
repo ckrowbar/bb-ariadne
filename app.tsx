@@ -17,7 +17,7 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { PluginThreadPanelProps } from "@get-bb/plugin-sdk/app";
-import type { Note, StagingEntry, Task, Workstream, rpcContract } from "./src/contract";
+import type { DeletionPreview, Note, StagingEntry, Task, Workstream, rpcContract } from "./src/contract";
 import { CHANGED_CHANNEL, type TaskStatus } from "./src/constants";
 import { workstreamFromSubPath } from "./src/route";
 import { Button } from "@/components/ui/button";
@@ -401,6 +401,84 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
   );
 }
 
+// ------------------------------------------------------- delete workstream
+
+function DeleteWorkstreamDialog({ name, onClose, onDeleted }: { name: string | null; onClose: () => void; onDeleted?: () => void }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [preview, setPreview] = useState<DeletionPreview | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setPreview(null);
+    setError(null);
+    if (name === null) return;
+    rpc.call("workstream_delete_preview", { name }).then(setPreview, (cause: unknown) =>
+      setError(cause instanceof Error ? cause.message : String(cause)),
+    );
+  }, [name, rpc]);
+
+  const confirm = async () => {
+    if (name === null) return;
+    setPending(true);
+    setError(null);
+    try {
+      await rpc.call("workstream_delete", { name });
+      onClose();
+      onDeleted?.();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <Dialog open={name !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Delete {name}?</DialogTitle>
+          <DialogDescription>This cannot be undone.</DialogDescription>
+        </DialogHeader>
+        {preview === null ? (
+          error === null ? <p className="text-sm text-muted-foreground">Checking workers for unsaved work…</p> : null
+        ) : (
+          <>
+            <ul className="list-disc space-y-1 pl-5 text-sm">
+              <li>
+                Archives {preview.liveWorkers} live worker {preview.liveWorkers === 1 ? "thread" : "threads"}. BB removes their
+                worktrees about five minutes later. Branches with unpushed commits are kept.
+              </li>
+              <li>Deletes the Ariadne thread and its worker threads, or archives it if BB refuses.</li>
+              <li>
+                Removes {preview.tasks} {preview.tasks === 1 ? "task" : "tasks"}, {preview.notes}{" "}
+                {preview.notes === 1 ? "note" : "notes"} and the audit trail. The staging log is kept.
+              </li>
+            </ul>
+            {preview.risks.length === 0 ? null : (
+              <div role="alert" className="space-y-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
+                {preview.risks.map((r) => (
+                  <p key={r.taskId} className="whitespace-pre-wrap">
+                    Work at risk in {r.title}: {r.risk}
+                  </p>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        <ErrorLine error={error} />
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="destructive" disabled={pending || preview === null} onClick={() => void confirm()}>
+            {pending ? "Deleting…" : "Delete workstream"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ------------------------------------------------------------------ pages
 
 function Counts({ ws }: { ws: Workstream }) {
@@ -451,6 +529,7 @@ function WorkstreamList() {
   const { data, error } = useLive(() => rpc.call("overview", null), [rpc]);
   const [creating, setCreating] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
+  const [deleting, setDeleting] = useState<string | null>(null);
   const workstreams = data?.workstreams.filter((w) => showArchived || !w.archived) ?? null;
   const archivedCount = data?.workstreams.filter((w) => w.archived).length ?? 0;
 
@@ -490,6 +569,15 @@ function WorkstreamList() {
                 <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
                   Open Ariadne
                 </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground"
+                  aria-label={`Delete ${ws.name}`}
+                  onClick={() => setDeleting(ws.name)}
+                >
+                  Delete
+                </Button>
               </li>
             ))}
           </ul>
@@ -502,6 +590,7 @@ function WorkstreamList() {
       </div>
       <LessonsSection />
       <NewWorkstreamDialog open={creating} onOpenChange={setCreating} />
+      <DeleteWorkstreamDialog name={deleting} onClose={() => setDeleting(null)} />
     </>
   );
 }
@@ -514,6 +603,7 @@ function WorkstreamDetail({ name }: { name: string }) {
   const { data, error } = useLive(() => rpc.call("overview", null), [rpc]);
   const [tab, setTab] = useState<Tab>("board");
   const [archiving, setArchiving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const ws = data?.workstreams.find((w) => w.name === name) ?? null;
 
   return (
@@ -535,6 +625,9 @@ function WorkstreamDetail({ name }: { name: string }) {
                 Archive
               </Button>
             )}
+            <Button variant="outline" size="sm" className="text-destructive" onClick={() => setDeleting(true)}>
+              Delete
+            </Button>
           </>
         )}
       </div>
@@ -600,6 +693,11 @@ function WorkstreamDetail({ name }: { name: string }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      <DeleteWorkstreamDialog
+        name={deleting ? name : null}
+        onClose={() => setDeleting(false)}
+        onDeleted={() => navigate.toPluginPanel(PANEL_PATH)}
+      />
     </>
   );
 }

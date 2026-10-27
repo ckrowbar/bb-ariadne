@@ -246,6 +246,7 @@ open threads through BB navigation.
 | Review what Ariadne has learned | **Lessons** list on the Ariadne page, with **Remove** |
 | Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
 | Retire a workstream | **Archive** on the workstream page. Archives the Ariadne thread and its workers. Archiving or deleting the Ariadne thread in BB also archives the workstream; the heartbeat catches deletes the plugin missed |
+| Delete a workstream | **Delete** on each workstream row (active or archived) and on the workstream page, or `bb ariadne delete <name> --yes`. The dialog lists what happens and shows uncommitted or unpushed work first. Archives live workers through the usual worktree retirement (branches with unpushed commits are kept), deletes the Ariadne thread and its child threads (archives it if BB refuses), then removes the workstream's tasks, notes and audit events. The staging log is kept because deleting does not undo what is on staging. Repeating a delete, or deleting after the thread is gone, succeeds |
 
 Data reaches the UI through plugin RPC, and a realtime signal refreshes open
 views when the board, notes or staging log change.
