@@ -44,6 +44,11 @@ function errorText(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
 }
 
+/** A confirmed "thread is gone" error; other errors may be transient. */
+function isNotFound(error: unknown): boolean {
+  return /\b404\b|not found/i.test(String(error));
+}
+
 function describeInteraction(interaction: unknown): string {
   const payload = (interaction as { payload?: Record<string, unknown> }).payload ?? {};
   const kind = typeof payload.kind === "string" ? payload.kind : "interaction";
@@ -310,7 +315,7 @@ export default async function plugin(bb: BbPluginApi) {
    * for deletion once teardown finishes. A branch with unpushed commits is
    * never deleted, so committed work survives in the repo either way.
    */
-  async function retireWorkerEnvironment(task: Task) {
+  async function retireWorkerEnvironment(task: Task, notify = true) {
     const environmentId = await environmentIdFor(task);
     if (environmentId === null) return;
     const env = await bb.sdk.environments.get({ environmentId });
@@ -322,7 +327,7 @@ export default async function plugin(bb: BbPluginApi) {
     const risk = await workAtRisk(task);
     if (risk !== null) {
       store.event("worktree-at-risk", risk, task.workstream, task.id);
-      const ws = store.workstream(task.workstream);
+      const ws = notify ? store.workstream(task.workstream) : undefined;
       const when = env.lifecycle.retireAt === null ? "soon" : `at ${new Date(env.lifecycle.retireAt).toISOString()}`;
       if (ws !== undefined)
         await tellAriadne(
@@ -441,12 +446,87 @@ export default async function plugin(bb: BbPluginApi) {
     for (const ws of store.workstreams().filter((w) => w.archived_at === null)) {
       const gone = await bb.sdk.threads.get({ threadId: ws.ariadne_thread_id }).then(
         (thread) => thread.deletedAt !== null,
-        (error: unknown) => /\b404\b|not found/i.test(String(error)),
+        isNotFound,
       );
       if (!gone) continue;
       store.archiveWorkstream(ws.name);
       store.event("workstream-orphaned", ws.ariadne_thread_id, ws.name);
       publish();
+    }
+  }
+
+  /** Worker threads of a workstream that are neither archived nor deleted. */
+  async function liveWorkers(tasks: Task[]): Promise<Task[]> {
+    const live: Task[] = [];
+    for (const task of tasks) {
+      if (task.workerThreadId === null) continue;
+      const thread = await bb.sdk.threads.get({ threadId: task.workerThreadId }).catch(() => null);
+      if (thread !== null && thread.archivedAt === null && thread.deletedAt === null) live.push(task);
+    }
+    return live;
+  }
+
+  async function deletionPreview(name: string) {
+    if (store.workstream(name) === undefined) throw new Error(`No workstream ${name}.`);
+    const tasks = store.tasks(name);
+    const risks: { taskId: string; title: string; risk: string }[] = [];
+    for (const task of tasks) {
+      const risk = await workAtRisk(task).catch(() => null);
+      if (risk !== null) risks.push({ taskId: task.id, title: task.title, risk });
+    }
+    return {
+      tasks: tasks.length,
+      notes: store.notes(name, 0).length,
+      liveWorkers: (await liveWorkers(tasks)).length,
+      risks,
+    };
+  }
+
+  // Workstreams mid-delete. Their workers' archive and delete events are
+  // handled here, so onThreadRetired must not warn an Ariadne that is going away.
+  const deleting = new Set<string>();
+
+  /**
+   * Archives live workers through the usual worktree retirement (branches
+   * with unpushed commits are kept), deletes the Ariadne thread (archives it
+   * if delete fails), then drops the workstream's rows. Safe to repeat: a
+   * missing workstream or an already-gone thread is not an error.
+   */
+  async function deleteWorkstream(name: string): Promise<string> {
+    const ws = store.workstream(name);
+    if (ws === undefined) return `No workstream ${name}; nothing to delete.`;
+    deleting.add(name);
+    try {
+      const workers = await liveWorkers(store.tasks(name));
+      for (const task of workers) {
+        try {
+          await bb.sdk.threads.archive({ threadId: task.workerThreadId! });
+          await retireWorkerEnvironment(task, false);
+        } catch (error) {
+          bb.log.warn(`delete ${name}: retiring worker ${task.workerThreadId} failed: ${String(error)}`);
+        }
+      }
+      let outcome: string;
+      try {
+        await bb.sdk.threads.delete({ threadId: ws.ariadne_thread_id, childThreadsConfirmed: true });
+        outcome = "deleted";
+      } catch (error) {
+        if (isNotFound(error)) {
+          outcome = "already gone";
+        } else {
+          bb.log.warn(`delete ${name}: deleting ${ws.ariadne_thread_id} failed, archiving: ${String(error)}`);
+          await bb.sdk.threads.archive({ threadId: ws.ariadne_thread_id }).catch((archiveError: unknown) => {
+            if (!isNotFound(archiveError)) throw archiveError;
+          });
+          outcome = "archived (delete failed)";
+        }
+      }
+      store.deleteWorkstream(name);
+      store.event("workstream-deleted", `${name} ${ws.ariadne_thread_id} ${outcome}, ${workers.length} workers archived`);
+      publish();
+      return `Deleted workstream ${name}: archived ${workers.length} live workers; Ariadne thread ${outcome}.`;
+    } finally {
+      deleting.delete(name);
     }
   }
 
@@ -838,7 +918,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     const task = store.taskByWorker(thread.id);
-    if (task === undefined) return;
+    if (task === undefined || deleting.has(task.workstream)) return;
     if (task.status === "running" || task.status === "blocked") store.updateTask(task.id, { status: "dropped" });
     publish();
     try {
@@ -887,6 +967,8 @@ export default async function plugin(bb: BbPluginApi) {
       publish();
       return { ok: true };
     },
+    workstream_delete_preview: async ({ name }) => deletionPreview(name),
+    workstream_delete: async ({ name }) => ({ ok: true, detail: await deleteWorkstream(name) }),
     board: async ({ workstream }) => ({ tasks: store.tasks(workstream) }),
     task_drop_preview: async ({ taskId }) => {
       const task = store.task(taskId);
@@ -944,6 +1026,24 @@ export default async function plugin(bb: BbPluginApi) {
                 `${w.name}${w.archived ? " (archived)" : ""}  ariadne=${w.ariadneThreadId}  project=${w.projectName ?? w.projectId}  running=${w.counts.running} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
             );
             return { exitCode: 0, stdout: lines.length === 0 ? "No workstreams." : lines.join("\n") };
+          },
+        }),
+        delete: cliCommand({
+          summary: "Delete a workstream: archive its workers, delete its Ariadne thread and drop its board and notes",
+          positionals: [{ name: "workstream", description: "Workstream name", required: true }],
+          options: { yes: { type: "boolean", description: "Delete without previewing first" } },
+          async run(input) {
+            const name = input.positionals.workstream;
+            if (!input.options.yes) {
+              if (store.workstream(name) === undefined) return { exitCode: 0, stdout: `No workstream ${name}; nothing to delete.` };
+              const preview = await deletionPreview(name);
+              const lines = [
+                `Deleting ${name} archives ${preview.liveWorkers} live workers, deletes its Ariadne thread, and removes ${preview.tasks} tasks and ${preview.notes} notes. The staging log is kept.`,
+                ...preview.risks.map((r) => `Work at risk in ${r.taskId} (${r.title}): ${r.risk}`),
+              ];
+              throw new PluginCliError(lines.join("\n"), { code: "confirm_delete", hint: `Re-run with --yes: bb ariadne delete ${name} --yes` });
+            }
+            return { exitCode: 0, stdout: await deleteWorkstream(name) };
           },
         }),
         board: cliCommand({
