@@ -566,17 +566,17 @@ function WorkstreamList() {
                   </span>
                 </button>
                 <Counts ws={ws} />
-                <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
-                  Open Ariadne
-                </Button>
                 <Button
                   variant="ghost"
-                  size="sm"
-                  className="text-muted-foreground"
+                  size="icon"
+                  className="size-8 text-muted-foreground hover:text-destructive"
                   aria-label={`Delete ${ws.name}`}
                   onClick={() => setDeleting(ws.name)}
                 >
-                  Delete
+                  <Icon name="Trash2" className="size-4" />
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+                  Open Ariadne
                 </Button>
               </li>
             ))}
@@ -617,16 +617,22 @@ function WorkstreamDetail({ name }: { name: string }) {
         <span className="flex-1" />
         {ws === null ? null : (
           <>
-            <Button size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
-              Open Ariadne
-            </Button>
             {ws.archived ? null : (
               <Button variant="outline" size="sm" onClick={() => setArchiving(true)}>
                 Archive
               </Button>
             )}
-            <Button variant="outline" size="sm" className="text-destructive" onClick={() => setDeleting(true)}>
-              Delete
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 text-muted-foreground hover:text-destructive"
+              aria-label={`Delete ${name}`}
+              onClick={() => setDeleting(true)}
+            >
+              <Icon name="Trash2" className="size-4" />
+            </Button>
+            <Button size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
+              Open Ariadne
             </Button>
           </>
         )}
