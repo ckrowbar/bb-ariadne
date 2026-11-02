@@ -1,31 +1,38 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { WorkerTurns, completedWorkerId, prNeedsAttention } from "./notifications.ts";
+import { WorkerTurns, prNeedsAttention } from "./notifications.ts";
 
-test("parses the worker from BB's child-completed text", () => {
-  assert.equal(completedWorkerId("[bb system]\n\n@thread:thr_95a8u33hn7 completed:\n\nI opened draft PR #2"), "thr_95a8u33hn7");
-  assert.equal(completedWorkerId("[bb system]\n\n@thread:thr_95a8u33hn7 failed:\n\nboom"), null);
-  assert.equal(completedWorkerId("@thread:thr_95a8u33hn7 completed: quoted by the user"), null);
-});
-
-test("a completion is redundant only after a report or a user-started turn", () => {
+test("Ariadne hears once per streak of user or background turns", () => {
   const turns = new WorkerTurns();
   const w = "thr_w";
-  assert.equal(turns.redundant(w), null, "unknown turns pass through");
+  assert.equal(turns.finished(w), null, "unknown turns say nothing");
 
-  turns.started(w, false);
-  assert.equal(turns.redundant(w), null, "an Ariadne-started turn with no report");
+  turns.started(w, "ariadne");
+  turns.active(w);
+  assert.equal(turns.finished(w), null, "a turn Ariadne started");
+
+  turns.started(w, "user");
+  turns.active(w);
+  assert.equal(turns.finished(w), "user");
+  turns.started(w, "user");
+  assert.equal(turns.finished(w), null, "the same conversation is flagged once");
+
+  turns.active(w);
+  assert.equal(turns.finished(w), "background", "a wake with no message is the worker's background task");
+  turns.active(w);
+  assert.equal(turns.finished(w), null, "repeated watcher wakes are flagged once");
+
+  turns.active(w);
   turns.reported(w);
-  assert.match(turns.redundant(w) ?? "", /reported/);
+  assert.equal(turns.finished(w), null, "a report ends the streak");
+  turns.active(w);
+  assert.equal(turns.finished(w), "background", "so the next wake is flagged again");
 
-  turns.started(w, true);
-  assert.match(turns.redundant(w) ?? "", /user started/);
-
-  turns.forget(w);
-  assert.equal(turns.redundant(w), null, "a steer from Ariadne forwards the answer");
-
-  turns.reported("thr_restarted");
-  assert.match(turns.redundant("thr_restarted") ?? "", /reported/, "reports count even without a recorded start");
+  turns.started(w, "user");
+  turns.steered(w);
+  assert.equal(turns.finished(w), null, "a steer from Ariadne makes the turn Ariadne's");
+  turns.started(w, "user");
+  assert.equal(turns.finished(w), "user");
 });
 
 test("draft and pending PRs stay out of the digest", () => {

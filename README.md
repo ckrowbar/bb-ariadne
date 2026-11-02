@@ -89,7 +89,8 @@ thread. Ariadne replied to each.
 
 The plugin now rejects a completion that repeats a report or answers the
 user directly. If rejection turns out noisy, the fallback is to drop the
-`done` relay in `ariadne_report` and keep only BB's completion.
+`done` relay in `ariadne_report` and keep only BB's completion. (2026-11-02:
+the hook never sees these notices; see below.)
 
 ## Quieter plugin messages (2026-10-21)
 
@@ -111,3 +112,44 @@ message bubble, and Ariadne answered each with "Nothing new."
    SDK's other levers are `bb.ui` surfaces and thread titles, which do not
    wake Ariadne. Not verified in the UI: whether BB shows anything for a turn
    that ends with no text.
+
+## Delayed steers and repeated asks (2026-11-02)
+
+Workstream deletion-requests: the user answered the same questions in
+Ariadne's thread and in worker thr_bqrx4bi299, and Ariadne's steers arrived
+in a burst at 20:56. Event logs from `bb thread log --json --all` for the
+manager (thr_a6b9n82dwi) and the worker, the plugin's own event table, and
+BB's server bundle (`server/dist/start-server.js`) show:
+
+1. **Steers were not delayed in delivery.** Every `bb thread tell` from
+   Ariadne reached the worker within a second (manager command at 20:56:46,
+   worker `client/turn/requested` at 20:56:46). Ariadne sent them late.
+2. **Ariadne's own question tool blocked it for hours.** Ariadne called
+   AskUserQuestion at 15:58 (answered 17:30) and 17:32 (answered 20:56).
+   BB's dispatch path queues any message to a thread with a pending
+   question: `if (payload.mode !== "start" && deps.pendingInteractions.hasTurnBoundPendingThreadInteraction(thread.id)) waitOn({ kind: "interaction" })`.
+   So worker reports, completions and digests waited, and Ariadne could not
+   steer. When the user answered, the backlog drained in about 8 minutes,
+   and Ariadne acted on hours-old asks one by one and asked the user more
+   blocking questions. The standing orders had told it to use its question
+   tool. They now forbid blocking questions.
+3. **The completion hook never fired.** The event table has no
+   `completion-skipped` row since PR #3. BB sends a child's notice through
+   `queueParentSystemMessage`, which starts or steers the parent's turn
+   directly. Only the queued fallback later passes `message.dispatch`, and
+   then the plugin's turn state may already belong to a later turn. The
+   plugin no longer rejects anything there.
+4. **Every root turn of a child notifies, whoever started it.**
+   `isParentNotifiableChildThread` is `parentThreadId !== null && originKind === null`,
+   and `originKind` is only ever `"fork"`. No spawn or thread option turns it
+   off. Background-task wakes (a CI watcher) are root turns too, which is why
+   thr_cyyyxqx5sq produced one notice per passing check.
+5. **`thread.idle` fires before the notice.** BB batches child notices for 2
+   seconds (`CHILD_THREAD_TURN_NOTIFICATION_BATCH_DELAY_MS = 2e3`), so a note
+   the plugin sends on `thread.idle` starts Ariadne's turn and the notice
+   joins it.
+
+The plugin now tells Ariadne, once per streak, when a worker turn was started
+by the user or by the worker's background task, so Ariadne can treat the
+notices as FYI. The deterministic alternative is to spawn workers without
+`parentThreadId` and forward turns from the plugin (spec, open question 2).
