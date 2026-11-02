@@ -48,9 +48,12 @@ with", so injected state would go stale.
 - **`child-completed` or a `done` report arrives.** Read the output. Update the
   task. Fold durable facts into notes and mark the task harvested. Summarise
   for the user only what they need to act on. Stay silent when it repeats a
-  report or answers a question the user asked the worker directly.
-- **Worker reports `blocked`.** Answer from notes and steer the worker if
-  possible. Otherwise escalate.
+  report, or when the plugin flags the turn as started by the user or by the
+  worker's background task (see Events).
+- **A worker asks for something** (blocked or not). Check notes and the
+  steers already sent. If it is answered, steer the answer again and say
+  nothing to the user. Otherwise answer from notes and steer the worker if
+  possible, or escalate.
 - **Plugin message arrives** (digest, worker report, stalled worker). Act on
   each item. If nothing needs the user, end the turn with no text.
 
@@ -67,6 +70,13 @@ log keeps the record.
   into it, because that affects teammates.
 - An action would post outside BB (Slack, Jira comments, PR comments).
 - Anything would merge, mark a PR ready, or deploy beyond staging.
+
+Ariadne asks in plain text with numbered options and ends its turn. It never
+uses a blocking question tool such as Claude Code's AskUserQuestion: while
+the question is pending, BB queues every message to the thread, including
+worker reports, completions, digests and the user's own messages, and
+Ariadne cannot steer anyone (README, 2026-11-02). It records the user's
+decisions in notes so it can answer repeat asks itself.
 
 ## Workers and environments
 
@@ -123,7 +133,9 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
   when it first needs it.
 - **Questions are clickable.** Claude Code's question tool became a
   `question` interaction with options. A question asked while another
-  interaction is pending fails, so the worker has to ask again.
+  interaction is pending fails, so the worker has to ask again. A pending
+  question also queues every other message to that thread, so Ariadne does
+  not use it (README, 2026-11-02).
 
 ## Data model (plugin SQLite)
 
@@ -180,7 +192,8 @@ kickoff prompt.
 
 | Source | Plugin does |
 | --- | --- |
-| BB `child-completed` | BB delivers it to Ariadne natively (spike finding 1). A `message.dispatch` hook rejects it when the worker sent a `pr-opened`, `blocked` or `done` report during that turn, or when the user started the turn in the worker thread. Ariadne then gets one message per event. A steer from Ariadne into the running turn clears both, so Ariadne gets the answer it asked for |
+| BB `child-completed` | BB delivers it to Ariadne natively (spike finding 1) for every finished worker turn, whoever started it. It does not pass the `message.dispatch` hook, so the plugin cannot drop or label it (README, 2026-11-02) |
+| `message.dispatch` on a worker, `thread.active`, `thread.idle` | The hook records who starts each worker turn: the user typing in the worker thread, or anyone else (Ariadne, the spawn prompt). A turn that goes active with no recorded start was woken by the worker's own background task, such as a CI watcher. When a user or background turn ends, the plugin tells Ariadne just before BB's notice (BB batches it for 2 seconds), once per streak. The streak ends when Ariadne steers the worker or the worker sends a `pr-opened`, `blocked` or `done` report |
 | `interaction.pending` on a worker | Tells Ariadne at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
 | `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Ariadne if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
 | `thread.archived` on a Ariadne thread | Marks the workstream archived |
@@ -238,7 +251,7 @@ open threads through BB navigation.
 | Talk to Ariadne, hand it a ticket | The pinned Ariadne thread. Plain chat |
 | See what is going on | **Ariadne** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
 | Same, without leaving the chat | **Board** thread panel on the Ariadne thread, same rows beside the conversation |
-| Answer an escalation | Ariadne asks with the provider's native question UI so answers are clicks. Verified for Claude Code in the worktree test. Free-form questions are ordinary chat |
+| Answer an escalation | Ariadne asks in chat with numbered options; reply in the Ariadne thread. It does not use the native question UI, because a pending question blocks every other message to Ariadne |
 | Unstick a worker waiting on approval | Ariadne's alert links the worker thread. BB's native approve or deny controls are there |
 | Check what Ariadne knows | **Notes** tab: read-only topics with revision history |
 | See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
@@ -285,15 +298,18 @@ bb ariadne staging [--limit <n>]
 ## Open questions
 
 1. Is a 30-minute idle threshold right for "stuck worker"?
-2. What does BB do with a rejected `child-completed`? The hook docs say a
-   rejected dispatch shows its message to the user and returns 409 to the
-   caller. The caller here is BB's own notifier, so it is unverified whether
-   the message shows anywhere, whether BB retries, or whether it marks the
-   worker. If it surfaces as noise, switch to a different channel (see the
-   README findings).
-3. Turn tracking lives in memory. After a plugin reload the first completion
-   per worker goes through as before, so Ariadne may see one duplicate.
+2. Should workers stop being BB children? Without `parentThreadId` BB
+   sends no completion notices, and the plugin could forward each worker
+   turn itself from `thread.idle` and `thread.failed`: labelled, deduped
+   against reports, and coalesced. The cost is losing sidebar nesting and
+   BB's native failure notices. This would replace the per-streak notes.
+3. Turn tracking lives in memory. After a plugin reload the plugin knows
+   nothing until each worker's next turn starts.
 4. The hook treats a worker turn as user-started when it has
    `initiator: user`, no sender and no `origin`. The logs confirm the first
    two for a message typed in the worker thread; `origin` comes from the SDK
-   docs. If the app sets an `origin`, those completions go through as before.
+   docs. If the app sets an `origin`, those turns count as Ariadne's.
+5. A turn with no recorded start counts as a background wake. That assumes
+   BB fires `thread.active` for a background-task wake, which the event log
+   suggests (`turn/started` with no `client/turn/requested`) but was not
+   observed through the plugin.

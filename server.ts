@@ -23,7 +23,7 @@ import {
   worktreeDirt,
 } from "./src/git";
 import { ariadneInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
-import { WorkerTurns, completedWorkerId, prNeedsAttention } from "./src/notifications";
+import { WorkerTurns, prNeedsAttention } from "./src/notifications";
 
 interface AriadneMetadata {
   role?: "ariadne" | "worker";
@@ -856,40 +856,29 @@ export default async function plugin(bb: BbPluginApi) {
   // ----------------------------------------------------------------- events
 
   // BB's native child-completed notification tells Ariadne when a worker
-  // finishes (spike finding 1). This hook drops it when Ariadne already knows:
-  // the worker reported this turn, or the user started the turn in the worker
-  // thread and has read the answer. The pass runs before BB queues anything,
-  // so it sees the completion as the worker's turn ends. A throw would fail
-  // the dispatch, so any error lets the message through.
+  // finishes (spike finding 1). It reaches Ariadne without passing this hook
+  // (README, 2026-11-02), so the plugin cannot drop or label it. The hook only
+  // records who starts each worker turn; thread.idle then tells Ariadne when a
+  // turn came from the user or a background task. A throw would fail the
+  // dispatch, so any error lets the message through.
   bb.experimental_hooks.on("message.dispatch", (ctx) => {
     try {
       const task = ctx.thread.originPluginId === bb.pluginId ? store.taskByWorker(ctx.thread.id) : undefined;
-      if (task !== undefined) {
-        // A send to a busy worker joins its turn or queues; only an idle worker starts a fresh one.
-        if (ctx.attempt === "start-turn" && ctx.thread.status !== "active") {
-          // A human follow-up has no sender and no origin. The plugin's spawn prompt also has no
-          // sender, so the first message (thread still pending, origin "plugin") never counts.
-          const byUser =
-            ctx.initiator === "user" && ctx.senderThreadId === null && ctx.origin === null && ctx.thread.status !== "pending";
-          workerTurns.started(ctx.thread.id, byUser);
-        } else if (ctx.attempt === "join-turn" && ctx.senderThreadId === store.workstream(task.workstream)?.ariadne_thread_id) {
-          workerTurns.forget(ctx.thread.id);
-        }
-        return { action: "proceed" };
+      if (task === undefined) return { action: "proceed" };
+      // A send to a busy worker joins its turn or queues; only an idle worker starts a fresh one.
+      if (ctx.attempt === "start-turn" && ctx.thread.status !== "active") {
+        // A human follow-up has no sender and no origin. The plugin's spawn prompt also has no
+        // sender, so the first message (thread still pending, origin "plugin") never counts.
+        const byUser =
+          ctx.initiator === "user" && ctx.senderThreadId === null && ctx.origin === null && ctx.thread.status !== "pending";
+        workerTurns.started(ctx.thread.id, byUser ? "user" : "ariadne");
+      } else if (ctx.attempt === "join-turn" && ctx.senderThreadId === store.workstream(task.workstream)?.ariadne_thread_id) {
+        workerTurns.steered(ctx.thread.id);
       }
-      if (ctx.initiator !== "system" || ctx.queuedMessages.length > 1) return { action: "proceed" };
-      const ws = store.workstreamByAriadne(ctx.thread.id);
-      const workerId = completedWorkerId(ctx.input.text);
-      const worker = workerId === null ? undefined : store.taskByWorker(workerId);
-      if (ws === undefined || workerId === null || worker?.workstream !== ws.name) return { action: "proceed" };
-      const reason = workerTurns.redundant(workerId);
-      if (reason === null) return { action: "proceed" };
-      store.event("completion-skipped", `${workerId}: ${reason}`, ws.name, worker.id);
-      return { action: "reject", message: `Ariadne skipped this completion: ${reason}.` };
     } catch (error) {
       bb.log.warn(`message.dispatch hook: ${String(error)}`);
-      return { action: "proceed" };
     }
+    return { action: "proceed" };
   });
 
   // These handlers cover what BB does not.
@@ -938,10 +927,30 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.events.on("thread.active", ({ thread }) => {
-    if (thread.originPluginId === bb.pluginId) markActivity();
+    if (thread.originPluginId !== bb.pluginId) return;
+    markActivity();
+    if (store.taskByWorker(thread.id) !== undefined) workerTurns.active(thread.id);
   });
-  bb.events.on("thread.idle", ({ thread }) => {
-    if (thread.originPluginId === bb.pluginId) markActivity();
+
+  // BB's completion notice follows about 2 seconds after the turn ends, so
+  // this note reaches Ariadne first and the notice joins the same turn.
+  bb.events.on("thread.idle", async ({ thread }) => {
+    if (thread.originPluginId !== bb.pluginId) return;
+    markActivity();
+    const by = workerTurns.finished(thread.id);
+    const task = by === null ? undefined : store.taskByWorker(thread.id);
+    const ws = task === undefined ? undefined : store.workstream(task.workstream);
+    if (task === undefined || ws === undefined) return;
+    store.event(`turn-by-${by}`, thread.id, ws.name, task.id);
+    const what =
+      by === "user"
+        ? "the user started by talking to it directly. BB's completion notice for it is FYI for your notes. Don't relay it and don't ask the user about it; they are discussing it there"
+        : "its own background task started (for example a CI watcher). Treat completion notices from such turns as progress: act only on a failure, a blocker or a finished result, and say nothing to the user otherwise";
+    await tellAriadne(
+      ws.ariadne_thread_id,
+      `${PLUGIN_PREFIX} Worker @thread:${thread.id} (${task.id}) finished a turn ${what}. Later turns like this are not flagged again until you steer it or it reports.`,
+      thread.id,
+    );
   });
 
   bb.background.schedule("heartbeat", HEARTBEAT_CRON, heartbeat);
