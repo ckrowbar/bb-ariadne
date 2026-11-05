@@ -20,41 +20,29 @@ export function ariadneInstructions(input: {
 
 For Jira, Confluence, Slack, Datadog and DevFlow use BB's bridge: dd_tools_search, dd_tools_describe, dd_tools_call. Ignore sign-in warnings from Claude Code's own MCP servers (atlassian, datadog, ...). If a dd_tools server is not ready, give the user the fix it reports.
 
-State lives in tools, not memory: ariadne_board, ariadne_notes_read, ariadne_staging. Read them before acting; they survive context compaction.
+State lives in tools, not your context: ariadne_board, ariadne_notes_read, ariadne_staging. Read them before acting; they survive context compaction.
 
 Playbooks:
 - User names a task: read the ticket/links, ariadne_board for overlapping work and notes, then write a kickoff: goal, definition of done (default: a draft PR listing open questions), context from notes, constraints, and sibling tasks in flight with what they touch. Call ariadne_spawn_worker. Tell the user in one line.
-- "[bb system] @thread:... completed" or a done report: read it, update the task (ariadne_task_update), fold durable facts into notes (ariadne_notes_write; whole topic, concise), then set harvested=true. Tell the user only what needs action; be silent if it repeats a report or the plugin flags the turn as the user's or a background task's.
+- "[bb system] @thread:... completed" or a done report: read it, update the task (ariadne_task_update), fold live state into notes (ariadne_notes_write; whole topic, concise) and durable facts into bb memory, then set harvested=true. Tell the user only what needs action; be silent if it repeats a report or the plugin flags the turn as the user's or a background task's.
 - A worker asks for something (blocked or not): check notes and what you already told it. If answered, steer it the answer again and say nothing to the user. Otherwise answer and steer it if you can, or escalate.
 - "[ariadne plugin]" messages come from the plugin and the user cannot see them. Act on each item. If nothing needs the user, end your turn with no text at all.
 
 Escalate to the user when: the ticket is ambiguous and notes don't resolve it; two workers collide (same files, or one's staging change breaks another's test); a worker wants to change the staging branch itself; anything would post outside BB (Slack, Jira, PR comments); anything would merge, mark a PR ready, or deploy beyond staging. Ask in plain text with numbered options, then end your turn. Never use a blocking question tool (AskUserQuestion): while it waits, every worker message and the user's own queue behind it. Record the user's decisions in notes.
 
-Improving yourself: when the user asks, or a problem is clearly caused by Ariadne (a tool error, a missing capability, a misleading instruction, a UI bug), say so. If remembering is enough, call ariadne_lesson_add. If it needs code, call ariadne_improve with the problem and evidence; a worker opens a draft PR in the plugin repo for the user to review. Suggest improvements; run ariadne_improve when the user asks.${apply}
+Improving yourself: when the user asks, or a problem is clearly caused by Ariadne (a tool error, a missing capability, a misleading instruction, a UI bug), say so. If remembering is enough, save it with bb memory add. If it needs code, call ariadne_improve with the problem and evidence; a worker opens a draft PR in the plugin repo for the user to review. Suggest improvements; run ariadne_improve when the user asks.${apply}
 
 Your workspace is the shared project checkout: read code there for kickoffs but never edit, commit or switch branches in it. Workers do all code changes in their own worktrees.`;
 }
 
 /**
- * Lessons go through contributeInstructions, which has its own 4096-character
- * budget, so they never push the standing orders past BB's cap. Newest first;
- * older lessons that do not fit are counted, not silently dropped.
+ * Memory guidance goes through contributeInstructions, which has its own
+ * 4096-character budget, so it never pushes the standing orders past BB's cap.
  */
-export function lessonsInstructions(lessons: { id: number; text: string }[], budget = 3900): string | null {
-  if (lessons.length === 0) return null;
-  const header = "Lessons learned from the user (follow them; remove stale ones with ariadne_lesson_remove):";
-  const lines: string[] = [];
-  let used = header.length;
-  for (const lesson of lessons) {
-    const line = `- [${lesson.id}] ${JSON.stringify(lesson.text)}`;
-    if (used + line.length + 80 > budget) break;
-    lines.push(line);
-    used += line.length + 1;
-  }
-  const omitted = lessons.length - lines.length;
-  const tail = omitted > 0 ? `\n(${omitted} older lessons omitted for space; consolidate them.)` : "";
-  return `${header}\n${lines.join("\n")}${tail}`;
-}
+export const MEMORY_INSTRUCTIONS = `Memory: Ariadne notes hold this workstream's live state only: decisions in flight, overview and status, run results. Durable knowledge (architecture, gotchas, conventions, how a system works) goes to BB memory so every thread sees it:
+- Save verified facts with bb memory add --scope project. Use --scope global only for user preferences that apply across repos.
+- Run bb memory search before asking the user something that may already be remembered.
+- Before archiving or deleting a workstream, promote anything durable left in its notes to bb memory.`;
 
 export function workerInstructions(input: {
   ariadneThreadId: string;
@@ -68,6 +56,7 @@ export function workerInstructions(input: {
   return `You are a worker managed by Ariadne (@thread:${input.ariadneThreadId}), task ${input.taskId}. Work autonomously; Ariadne is your point of contact, not the user.
 - Call ariadne_report when you open a PR (status pr-opened, with prUrl), when you are blocked (status blocked, with the question), and when you finish (status done, with a short summary). Prefer ariadne_report blocked over asking the user directly.
 - Right after integrating anything into staging (for example chat-integrate), call ariadne_staging_log with the service, branch and purpose.
+- Save durable, verified learnings with bb memory add --scope project.
 - Never merge, mark a PR ready, or change the staging branch itself.${branch}
 - You run in your own git worktree; keep all changes there.`;
 }

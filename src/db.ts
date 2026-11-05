@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { TaskStatus } from "./constants";
-import type { Lesson, Note, PrSummary, StagingEntry, Task } from "./contract";
+import type { Note, PrSummary, StagingEntry, Task } from "./contract";
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 
@@ -107,7 +107,8 @@ const MIGRATIONS = [
      key TEXT PRIMARY KEY,
      signature TEXT NOT NULL,
      updated_at INTEGER NOT NULL)`,
-  // Lessons are global: behaviour adjustments every Ariadne reads at session start.
+  // Retired: lessons moved to BB memory. Kept so migration indexes stay stable;
+  // a later migration can drop the table.
   `CREATE TABLE lessons (
      id INTEGER PRIMARY KEY AUTOINCREMENT,
      text TEXT NOT NULL,
@@ -370,26 +371,6 @@ export function openStore(bb: BbPluginApi) {
     },
     bumpBranchCleanup(environmentId: string) {
       db.prepare("UPDATE branch_cleanup SET attempts = attempts + 1 WHERE environment_id = ?").run(environmentId);
-    },
-
-    // Lessons
-    lessons(): Lesson[] {
-      const rows = db.prepare("SELECT * FROM lessons ORDER BY id DESC").all() as {
-        id: number;
-        text: string;
-        source_thread_id: string | null;
-        created_at: number;
-      }[];
-      return rows.map((r) => ({ id: r.id, text: r.text, sourceThreadId: r.source_thread_id, createdAt: r.created_at }));
-    },
-    addLesson(text: string, sourceThreadId: string | null): number {
-      const result = db
-        .prepare("INSERT INTO lessons (text, source_thread_id, created_at) VALUES (?, ?, ?)")
-        .run(text, sourceThreadId, Date.now());
-      return Number(result.lastInsertRowid);
-    },
-    removeLesson(id: number): boolean {
-      return db.prepare("DELETE FROM lessons WHERE id = ?").run(id).changes > 0;
     },
 
     // Heartbeat dedupe: returns true when the signature for key changed.

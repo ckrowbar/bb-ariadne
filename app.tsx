@@ -491,38 +491,6 @@ function Counts({ ws }: { ws: Workstream }) {
   );
 }
 
-function LessonsSection() {
-  const rpc = useRpc<typeof rpcContract>();
-  const { data, refetch } = useLive(() => rpc.call("lessons", null), [rpc]);
-  if (data === null || data.lessons.length === 0) return null;
-  return (
-    <section className="mt-8">
-      <h3 className="text-sm font-semibold">Lessons</h3>
-      <p className="mt-1 text-xs text-muted-foreground">
-        What Ariadne has learned from you. Every Ariadne follows these from its next session. Ask Ariadne to change them, or
-        remove one here.
-      </p>
-      <ul className="mt-2 divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
-        {data.lessons.map((lesson) => (
-          <li key={lesson.id} className="flex items-start gap-3 px-3 py-2 text-sm">
-            <span className="min-w-0 flex-1">{lesson.text}</span>
-            <span className="text-xs text-muted-foreground">{relativeTime(lesson.createdAt)}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-auto py-0 text-muted-foreground"
-              aria-label={`Remove lesson ${lesson.id}`}
-              onClick={() => void rpc.call("lesson_remove", { id: lesson.id }).then(refetch, refetch)}
-            >
-              Remove
-            </Button>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
 function WorkstreamList() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -588,7 +556,6 @@ function WorkstreamList() {
           </Button>
         ) : null}
       </div>
-      <LessonsSection />
       <NewWorkstreamDialog open={creating} onOpenChange={setCreating} />
       <DeleteWorkstreamDialog name={deleting} onClose={() => setDeleting(null)} />
     </>
