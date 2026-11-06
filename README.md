@@ -11,8 +11,8 @@ Design: [docs/v0-spec.md](docs/v0-spec.md).
 Everything you need is in the BB app:
 
 - **Ariadne** in the sidebar: create a workstream, open its Ariadne thread, and
-  see each workstream's board, notes and staging log. Lessons Ariadne has
-  learned are listed there too.
+  see each workstream's board, notes and staging log. Durable knowledge lives
+  in BB memory (`bb memory catalog`), not in Ariadne.
 - **Ariadne board** in a thread's panel launcher: the board beside the chat.
 - The home page lists active workstreams with task counts.
 

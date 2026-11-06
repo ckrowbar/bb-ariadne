@@ -32,7 +32,9 @@ agents and scripting, not as the user's interface.
 | Layer | What | Where |
 | --- | --- | --- |
 | Standing orders | Role, autonomy, escalation rules, playbooks | Static instructions from `configure()` |
+| Memory guidance | Notes versus BB memory | Static text from `contributeInstructions` |
 | State | Notes, board, staging log | Plugin SQLite, read through tools |
+| Durable knowledge | Architecture, gotchas, conventions, user preferences | BB memory (`bb memory`), injected into every thread by BB's Memory plugin |
 | Triggers | User messages, BB `child-completed`, worker reports, heartbeat digests | Arrive as turns on the Ariadne thread |
 
 Board state is read through tools, not injected into instructions. The plugin
@@ -147,7 +149,7 @@ tasks(id PRIMARY KEY, workstream, title, links_json, worker_thread_id,
       environment_id, status, pr_url, summary, harvested, updated_at)
 staging_log(id PRIMARY KEY, at, worker_thread_id, task_id, service, branch, purpose)
 events(id PRIMARY KEY, at, workstream, task_id, kind, detail)  -- audit trail
-lessons(id PRIMARY KEY, text, source_thread_id, created_at)    -- global
+lessons(id PRIMARY KEY, text, source_thread_id, created_at)    -- retired, unused
 branch_cleanup(environment_id PRIMARY KEY, repo_path, branch, base_ref, attempts, requested_at)
 digest_state(key PRIMARY KEY, signature, updated_at)          -- heartbeat dedupe
 ```
@@ -157,8 +159,15 @@ Task `status`: `running`, `blocked`, `in-review`, `done`, `dropped`. A worker's
 moves it to `done` when the PR merges.
 
 Notes are written only by machines (Ariadne and the plugin). Every write keeps
-the previous revision, so a bad update can be rolled back. Suggested starting
-topics: `overview`, `people`, `architecture`, `conventions`, `gotchas`.
+the previous revision, so a bad update can be rolled back. Notes hold the
+workstream's live state: decisions in flight, overview and status, run results.
+Suggested topics: `overview`, `status`, `decisions`, `runs`. Durable knowledge
+(architecture, gotchas, conventions, how a system works) goes to BB memory with
+`bb memory add --scope project`, so workers and other threads see it without
+asking Ariadne. Global scope is only for user preferences that apply across
+repos. Before archiving or deleting a workstream, Ariadne promotes anything
+durable left in its notes to BB memory. Workers save durable, verified
+learnings to project memory themselves.
 
 ## Agent tools
 
@@ -174,7 +183,6 @@ the spike).
 | `ariadne_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
 | `ariadne_notes_read(topic?)` / `ariadne_notes_write(topic, body)` | Reads or replaces a note topic |
 | `ariadne_staging(limit?)` | Lists recent staging log entries across all workstreams |
-| `ariadne_lesson_add(text)` / `ariadne_lesson_remove(id)` | Saves or removes a global lesson (see Self-improvement) |
 | `ariadne_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo (see Self-improvement) |
 
 **Worker threads**
@@ -218,12 +226,11 @@ Any spawn, worker report or worker lifecycle event restarts it.
 The user can ask Ariadne to fix or improve itself, and Ariadne suggests it when a
 problem is clearly its own. There are two paths:
 
-- **Lessons**, for behaviour that remembering can fix (a preference, a
-  playbook tweak). `ariadne_lesson_add` stores a global lesson. Every Ariadne
-  receives lessons through `contributeInstructions`, which has its own
-  4096-character budget, so lessons never push the standing orders past BB's
-  cap. A live session keeps its instructions, so other Ariadne threads pick a lesson up
-  at their next session. Lessons are listed, and removable, on the Ariadne page.
+- **Memory**, for behaviour that remembering can fix (a preference, a
+  playbook tweak). Ariadne saves it with `bb memory add`. BB's Memory plugin
+  injects a summary index into every thread, and the user reviews or removes
+  memories with BB's own memory tools. This replaced Ariadne's lessons
+  (`ariadne_lesson_add`), which only Ariadne threads could see.
 - **Code**, for anything else. `ariadne_improve` spawns a worker in a managed
   worktree of the plugin repo (BB project set by the `pluginProjectId` setting;
   `.bb-env-setup.sh` runs `npm ci`). The worker typechecks, builds, pushes a
@@ -235,8 +242,8 @@ problem is clearly its own. There are two paths:
   builds and reloads the plugin. A reviewed PR is the guard against Ariadne
   widening its own permissions.
 
-Verified 2026-10-15: lesson 1 (Haiku for throwaway tasks) was followed on the
-next spawn, and an improvement request produced
+Verified 2026-10-15: a lesson (Haiku for throwaway tasks, since moved to BB
+memory) was followed on the next spawn, and an improvement request produced
 [ckrowbar/bb-ariadne#1](https://github.com/ckrowbar/bb-ariadne/pull/1).
 
 ## UI
@@ -256,7 +263,7 @@ open threads through BB navigation.
 | Check what Ariadne knows | **Notes** tab: read-only topics with revision history |
 | See what is on staging | **Staging** tab: recent integrations by service, branch, worker and time, across workstreams |
 | Drop a task | **Drop** on the board row. The dialog shows uncommitted or unpushed work first. Archives the worker thread and marks the task `dropped` |
-| Review what Ariadne has learned | **Lessons** list on the Ariadne page, with **Remove** |
+| Review what Ariadne has learned | BB memory (`bb memory catalog`) |
 | Glance at everything | Home page section: each workstream with counts of running, blocked and in-review tasks |
 | Retire a workstream | **Archive** on the workstream page. Archives the Ariadne thread and its workers. Archiving or deleting the Ariadne thread in BB also archives the workstream; the heartbeat catches deletes the plugin missed |
 | Delete a workstream | The trash icon left of **Open Ariadne** on each workstream row (active or archived) and on the workstream page, or `bb ariadne delete <name> --yes`. The dialog lists what happens and shows uncommitted or unpushed work first. Archives live workers through the usual worktree retirement (branches with unpushed commits are kept), deletes the Ariadne thread and its child threads (archives it if BB refuses), then removes the workstream's tasks, notes and audit events. The staging log is kept because deleting does not undo what is on staging. Repeating a delete, or deleting after the thread is gone, succeeds |

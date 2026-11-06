@@ -22,7 +22,7 @@ import {
   refreshBase,
   worktreeDirt,
 } from "./src/git";
-import { ariadneInstructions, lessonsInstructions, workerInstructions } from "./src/instructions";
+import { ariadneInstructions, MEMORY_INSTRUCTIONS, workerInstructions } from "./src/instructions";
 import { WorkerTurns, prNeedsAttention } from "./src/notifications";
 
 interface AriadneMetadata {
@@ -595,8 +595,6 @@ export default async function plugin(bb: BbPluginApi) {
           "ariadne_notes_read",
           "ariadne_notes_write",
           "ariadne_staging",
-          "ariadne_lesson_add",
-          "ariadne_lesson_remove",
           ...(config.pluginProjectId === "" ? [] : ["ariadne_improve"]),
         ],
         skills: [],
@@ -624,7 +622,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.contributeInstructions(({ threadId }) =>
-    store.workstreamByAriadne(threadId) === undefined ? null : lessonsInstructions(store.lessons()),
+    store.workstreamByAriadne(threadId) === undefined ? null : MEMORY_INSTRUCTIONS,
   );
 
   async function requireAriadne(threadId: string): Promise<WorkstreamRow | string> {
@@ -705,7 +703,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "ariadne_notes_write",
     description:
-      "Replace a note topic with a new body. Previous versions are kept. Suggested topics: overview, people, architecture, conventions, gotchas.",
+      "Replace a note topic with a new body. Previous versions are kept. Notes hold this workstream's live state; suggested topics: overview, status, decisions, runs. Durable knowledge goes to bb memory.",
     presentation: { label: { pending: "Updating notes", completed: "Updated notes" } },
     parameters: z.object({
       topic: z.string().min(1).max(60).regex(/^[a-z0-9-]+$/),
@@ -733,38 +731,6 @@ export default async function plugin(bb: BbPluginApi) {
       return entries
         .map((e) => `${new Date(e.at).toISOString()} ${e.service} ← ${e.branch} (${e.workstream}, @thread:${e.workerThreadId}): ${e.purpose}`)
         .join("\n");
-    },
-  });
-
-
-  bb.agents.registerTool({
-    name: "ariadne_lesson_add",
-    description:
-      "Remember a behaviour adjustment for every Ariadne, e.g. a user preference or playbook tweak. Applies from each Ariadne's next session.",
-    presentation: { label: { pending: "Saving lesson", completed: "Saved lesson" } },
-    parameters: z.object({ text: z.string().min(5).max(400) }),
-    async execute({ text: lesson }, { threadId }) {
-      const ws = await requireAriadne(threadId);
-      if (typeof ws === "string") return errorText(ws);
-      const id = store.addLesson(lesson, threadId);
-      store.event("lesson-added", lesson, ws.name);
-      publish();
-      return `Saved lesson ${id}. Follow it now; other Ariadne threads pick it up at their next session.`;
-    },
-  });
-
-  bb.agents.registerTool({
-    name: "ariadne_lesson_remove",
-    description: "Remove a lesson that is wrong or stale, by id.",
-    presentation: { label: { pending: "Removing lesson", completed: "Removed lesson" } },
-    parameters: z.object({ id: z.number().int() }),
-    async execute({ id }, { threadId }) {
-      const ws = await requireAriadne(threadId);
-      if (typeof ws === "string") return errorText(ws);
-      if (!store.removeLesson(id)) return errorText(`No lesson ${id}.`);
-      store.event("lesson-removed", String(id), ws.name);
-      publish();
-      return `Removed lesson ${id}.`;
     },
   });
 
@@ -984,13 +950,6 @@ export default async function plugin(bb: BbPluginApi) {
       return { risk: task === undefined ? null : await workAtRisk(task) };
     },
     task_drop: async ({ taskId }) => ({ ok: true, detail: await dropTask(taskId) }),
-    lessons: async () => ({ lessons: store.lessons() }),
-    lesson_remove: async ({ id }) => {
-      const ok = store.removeLesson(id);
-      if (ok) store.event("lesson-removed", `${id} (from UI)`);
-      publish();
-      return { ok };
-    },
     notes: async ({ workstream }) => ({ notes: store.notes(workstream) }),
     staging: async ({ limit }) => ({ entries: store.staging(limit) }),
     thread_context: async ({ threadId }) => {

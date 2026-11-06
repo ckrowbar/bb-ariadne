@@ -75,14 +75,6 @@ const stagingEntrySchema = z.object({
 });
 export type StagingEntry = z.infer<typeof stagingEntrySchema>;
 
-const lessonSchema = z.object({
-  id: z.number(),
-  text: z.string(),
-  sourceThreadId: z.string().nullable(),
-  createdAt: z.number(),
-});
-export type Lesson = z.infer<typeof lessonSchema>;
-
 const deletionPreviewSchema = z.object({
   tasks: z.number(),
   notes: z.number(),
@@ -141,14 +133,6 @@ export const rpcContract = defineRpcContract({
   staging: {
     input: z.object({ limit: z.number().int().min(1).max(200) }),
     output: z.object({ entries: z.array(stagingEntrySchema) }),
-  },
-  lessons: {
-    input: z.null(),
-    output: z.object({ lessons: z.array(lessonSchema) }),
-  },
-  lesson_remove: {
-    input: z.object({ id: z.number() }),
-    output: z.object({ ok: z.boolean() }),
   },
   thread_context: {
     input: z.object({ threadId: z.string() }),
