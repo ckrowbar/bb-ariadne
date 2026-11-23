@@ -57,3 +57,35 @@ test("deleting is idempotent and frees the name", () => {
   store.insertWorkstream("again", "thr_a3", "proj", []);
   assert.equal(store.workstream("again")?.ariadne_thread_id, "thr_a3");
 });
+
+test("workstreams store and parse Ariadne and worker execution overrides", () => {
+  const { store } = memoryStore();
+  store.insertWorkstream("defaults", "thr_a1", "proj", []);
+  const defRow = store.workstream("defaults")!;
+  assert.equal(defRow.ariadne_execution_json, null);
+  assert.equal(defRow.worker_execution_json, null);
+  assert.deepEqual(store.ariadneExecution(defRow), {
+    providerId: null,
+    model: null,
+    reasoningLevel: null,
+    serviceTier: null,
+  });
+
+  store.insertWorkstream("custom", "thr_a2", "proj", [], {
+    ariadne: { providerId: "claude-code", model: "claude-opus-5-5", reasoningLevel: "high", serviceTier: "fast" },
+    worker: { providerId: "codex", model: "gpt-6.2-sol", reasoningLevel: "medium", serviceTier: null },
+  });
+  const customRow = store.workstream("custom")!;
+  assert.deepEqual(store.ariadneExecution(customRow), {
+    providerId: "claude-code",
+    model: "claude-opus-5-5",
+    reasoningLevel: "high",
+    serviceTier: "fast",
+  });
+  assert.deepEqual(store.workerExecution(customRow), {
+    providerId: "codex",
+    model: "gpt-6.2-sol",
+    reasoningLevel: "medium",
+    serviceTier: null,
+  });
+});

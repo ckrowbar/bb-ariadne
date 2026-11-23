@@ -142,7 +142,8 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
 ## Data model (plugin SQLite)
 
 ```sql
-workstreams(name PRIMARY KEY, ariadne_thread_id, links_json, created_at)
+workstreams(name PRIMARY KEY, ariadne_thread_id, project_id, links_json,
+            ariadne_execution_json, worker_execution_json, archived_at, created_at)
 notes(workstream, topic, body, revision, updated_at, PRIMARY KEY (workstream, topic))
 note_revisions(workstream, topic, revision, body, written_by_thread_id, written_at)
 tasks(id PRIMARY KEY, workstream, title, links_json, worker_thread_id,
@@ -178,7 +179,7 @@ the spike).
 
 | Tool | Does |
 | --- | --- |
-| `ariadne_spawn_worker(title, prompt, links?, model?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
+| `ariadne_spawn_worker(title, prompt, links?, providerId?, model?, reasoningLevel?, serviceTier?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
 | `ariadne_board(status?)` | Lists this workstream's tasks: status, harvested, worker, branch, PR and checks state, summary. `bb ariadne board` prints the same row |
 | `ariadne_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
 | `ariadne_notes_read(topic?)` / `ariadne_notes_write(topic, body)` | Reads or replaces a note topic |
@@ -248,13 +249,16 @@ memory) was followed on the next spawn, and an improvement request produced
 
 ## UI
 
-v0 uses stable plugin slots only (`app.slots.navPanel`,
-`app.slots.threadPanelAction`, `app.slots.homepageSection`). Thread links
-open threads through BB navigation.
+v0 uses stable plugin slots (`app.slots.navPanel`,
+`app.slots.settingsSection`, `app.slots.threadPanelAction`,
+`app.slots.homepageSection`) and BB's `experimental_ProviderModelPicker` for
+choosing provider, model, reasoning level and service tier. Thread links open
+threads through BB navigation.
 
 | Human interaction | Where you click |
 | --- | --- |
-| Start a workstream | **Ariadne** sidebar page → **New workstream** (name, optional links). Creates a pinned Ariadne thread and opens it |
+| Configure default models | **Settings** → **Installed plugins** → **Ariadne** → **Agents**: pick default provider, model, reasoning level and service tier for Ariadne threads and workers (stored in plugin KV; reset to inherit BB defaults) |
+| Start a workstream | **Ariadne** sidebar page → **New workstream** (name, project, optional Ariadne and worker model overrides, optional links). Creates a pinned Ariadne thread with those settings and opens it; workers spawned in the workstream inherit its worker selection |
 | Talk to Ariadne, hand it a ticket | The pinned Ariadne thread. Plain chat |
 | See what is going on | **Ariadne** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
 | Same, without leaving the chat | **Board** thread panel on the Ariadne thread, same rows beside the conversation |
@@ -288,6 +292,8 @@ For agents and scripting.
 
 ```
 bb ariadne create <workstream> [--project <id>] [--link <url>]...
+  [--provider <id>] [--model <id>] [--reasoning-level <level>] [--service-tier <tier>]
+  [--worker-provider <id>] [--worker-model <id>] [--worker-reasoning-level <level>] [--worker-service-tier <tier>]
 bb ariadne list                      # workstreams and their Ariadne threads
 bb ariadne board <workstream>        # same rows as ariadne_board
 bb ariadne notes <workstream> [topic]

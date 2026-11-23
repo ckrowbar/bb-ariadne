@@ -12,13 +12,33 @@ import {
   Markdown,
   UrlLink,
   definePluginApp,
+  experimental_ProviderModelPicker as ProviderModelPicker,
+  experimental_useProviders as useProviders,
   useBbNavigate,
   useRealtime,
   useRpc,
+  useSdk,
 } from "@get-bb/plugin-sdk/app";
-import type { PluginThreadPanelProps } from "@get-bb/plugin-sdk/app";
-import type { DeletionPreview, Note, StagingEntry, Task, Workstream, rpcContract } from "./src/contract";
-import { CHANGED_CHANNEL, type TaskStatus } from "./src/constants";
+import type { ExperimentalProviderModelPickerValue, PluginThreadPanelProps } from "@get-bb/plugin-sdk/app";
+import { toast } from "sonner";
+import type {
+  AgentDefaults,
+  DeletionPreview,
+  ExecutionConfig,
+  Note,
+  StagingEntry,
+  Task,
+  Workstream,
+  rpcContract,
+} from "./src/contract";
+import { CHANGED_CHANNEL, type ReasoningLevel, type TaskStatus } from "./src/constants";
+import {
+  DEFAULT_AGENT_DEFAULTS,
+  EMPTY_EXECUTION,
+  formatExecutionSummary,
+  hasExecutionOverrides,
+  mergeExecution,
+} from "./src/execution";
 import { workstreamFromSubPath } from "./src/route";
 import { Button } from "@/components/ui/button";
 import {
@@ -307,25 +327,232 @@ function StagingView() {
   );
 }
 
+// ------------------------------------------------------- execution pickers
+
+function useFallbackModel(providerId: string, hostId: string | null, enabled: boolean) {
+  const sdk = useSdk();
+  const [fallback, setFallback] = useState<{
+    providerId: string;
+    hostId: string | null;
+    model: string;
+    reasoningLevel: ReasoningLevel;
+    serviceTier?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!enabled || providerId === "") return;
+    let cancelled = false;
+    sdk.providers
+      .models(hostId ? { providerId, hostId } : { providerId })
+      .then((result) => {
+        if (cancelled) return;
+        const chosen = result.models.find((m) => m.isDefault) ?? result.models[0];
+        if (!chosen) return;
+        setFallback({
+          providerId,
+          hostId,
+          model: chosen.model,
+          reasoningLevel: chosen.defaultReasoningEffort,
+          ...(chosen.supportedServiceTiers && chosen.supportedServiceTiers.length > 0
+            ? { serviceTier: chosen.supportedServiceTiers[0].id }
+            : {}),
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sdk, providerId, hostId, enabled]);
+
+  return fallback !== null && fallback.providerId === providerId && fallback.hostId === hostId ? fallback : null;
+}
+
+function ExecutionPickerField({
+  label,
+  description,
+  effective,
+  isCustom,
+  defaultTag,
+  resetLabel,
+  hostId,
+  disabled,
+  onChange,
+  onReset,
+}: {
+  label: string;
+  description?: string;
+  effective: ExecutionConfig;
+  isCustom: boolean;
+  defaultTag: string;
+  resetLabel: string;
+  hostId: string | null;
+  disabled?: boolean;
+  onChange: (next: ExecutionConfig) => void;
+  onReset: () => void;
+}) {
+  const { providers } = useProviders();
+  const fallbackProvider = providers[0]?.id ?? "claude-code";
+  const resolvedProviderId = effective.providerId ?? fallbackProvider;
+  const needsFallback = effective.model === null;
+  const fallback = useFallbackModel(resolvedProviderId, hostId, needsFallback);
+  const serviceTier = effective.serviceTier ?? (needsFallback ? fallback?.serviceTier : undefined);
+  const pickerValue: ExperimentalProviderModelPickerValue = {
+    providerId: resolvedProviderId,
+    model: effective.model ?? fallback?.model ?? "",
+    reasoningLevel: effective.reasoningLevel ?? (needsFallback ? fallback?.reasoningLevel : undefined) ?? "medium",
+    ...(serviceTier ? { serviceTier } : {}),
+  };
+
+  return (
+    <div className="space-y-1 text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium">{label}</span>
+        {isCustom ? (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto px-0 text-xs"
+            disabled={disabled}
+            onClick={onReset}
+          >
+            {resetLabel}
+          </Button>
+        ) : (
+          <span className="text-xs text-muted-foreground">{defaultTag}</span>
+        )}
+      </div>
+      <ProviderModelPicker
+        value={pickerValue}
+        routing={hostId ? { kind: "host", hostId } : undefined}
+        disabled={disabled}
+        onChange={(val) =>
+          onChange({
+            providerId: val.providerId,
+            model: val.model || null,
+            reasoningLevel: val.reasoningLevel,
+            serviceTier: val.serviceTier ?? null,
+          })
+        }
+      />
+      {description ? <p className="text-xs text-muted-foreground">{description}</p> : null}
+    </div>
+  );
+}
+
+function AriadneSettingsSection() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [defaults, setDefaults] = useState<AgentDefaults | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    rpc.call("agent_defaults_get", null).then(
+      (value) => {
+        setDefaults(value);
+        setError(null);
+      },
+      (cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)),
+    );
+  }, [rpc]);
+
+  useEffect(load, [load]);
+  useRealtime(CHANGED_CHANNEL, load);
+
+  const persist = async (next: AgentDefaults) => {
+    const previous = defaults;
+    setDefaults(next);
+    setSaving(true);
+    setError(null);
+    try {
+      const saved = await rpc.call("agent_defaults_set", next);
+      setDefaults(saved);
+      toast.success("Saved Ariadne agent defaults");
+    } catch (cause) {
+      setDefaults(previous);
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message);
+      toast.error(message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (defaults === null) {
+    return error === null ? (
+      <p className="text-xs text-muted-foreground">Loading agent defaults…</p>
+    ) : (
+      <ErrorLine error={error} />
+    );
+  }
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-card p-4">
+      <ExecutionPickerField
+        label="Ariadne (manager)"
+        description="Default for new workstream manager threads unless overridden in New workstream."
+        effective={defaults.ariadne}
+        isCustom={hasExecutionOverrides(defaults.ariadne)}
+        defaultTag="BB default"
+        resetLabel="Reset to BB default"
+        hostId={null}
+        disabled={saving}
+        onChange={(ariadne) => void persist({ ...defaults, ariadne })}
+        onReset={() => void persist({ ...defaults, ariadne: { ...EMPTY_EXECUTION } })}
+      />
+      <ExecutionPickerField
+        label="Workers"
+        description="Default for worker threads unless overridden on a workstream or task."
+        effective={defaults.worker}
+        isCustom={hasExecutionOverrides(defaults.worker)}
+        defaultTag="BB default"
+        resetLabel="Reset to BB default"
+        hostId={null}
+        disabled={saving}
+        onChange={(worker) => void persist({ ...defaults, worker })}
+        onReset={() => void persist({ ...defaults, worker: { ...EMPTY_EXECUTION } })}
+      />
+      <ErrorLine error={error} />
+    </div>
+  );
+}
+
 // ------------------------------------------------------- new workstream
 
 function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const [projects, setProjects] = useState<{ id: string; name: string; kind: string }[]>([]);
+  const [projects, setProjects] = useState<{ id: string; name: string; kind: string; hostId: string | null }[]>([]);
+  const [defaults, setDefaults] = useState<AgentDefaults>(DEFAULT_AGENT_DEFAULTS);
   const [name, setName] = useState("");
   const [projectId, setProjectId] = useState("");
   const [links, setLinks] = useState("");
+  const [ariadneOverride, setAriadneOverride] = useState<ExecutionConfig | null>(null);
+  const [workerOverride, setWorkerOverride] = useState<ExecutionConfig | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
-    rpc.call("projects", null).then((result) => {
-      setProjects(result.projects);
-      setProjectId((current) => current || (result.projects.find((p) => p.kind === "standard") ?? result.projects[0])?.id || "");
-    }, (cause: unknown) => setError(String(cause)));
+    setAriadneOverride(null);
+    setWorkerOverride(null);
+    setError(null);
+    Promise.all([rpc.call("projects", null), rpc.call("agent_defaults_get", null)]).then(
+      ([projectResult, defaultsResult]) => {
+        setProjects(projectResult.projects);
+        setProjectId(
+          (current) =>
+            current || (projectResult.projects.find((p) => p.kind === "standard") ?? projectResult.projects[0])?.id || "",
+        );
+        setDefaults(defaultsResult);
+      },
+      (cause: unknown) => setError(String(cause)),
+    );
   }, [open, rpc]);
+
+  const selectedHostId = projects.find((p) => p.id === projectId)?.hostId ?? null;
+  const effectiveAriadne = ariadneOverride ? mergeExecution(defaults.ariadne, ariadneOverride) : defaults.ariadne;
+  const effectiveWorker = workerOverride ? mergeExecution(defaults.worker, workerOverride) : defaults.worker;
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -337,10 +564,14 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
         name: name.trim(),
         projectId,
         links: links.split("\n").map((l) => l.trim()).filter(Boolean),
+        ...(ariadneOverride ? { ariadne: ariadneOverride } : {}),
+        ...(workerOverride ? { worker: workerOverride } : {}),
       });
       onOpenChange(false);
       setName("");
       setLinks("");
+      setAriadneOverride(null);
+      setWorkerOverride(null);
       navigate.toThread(result.ariadneThreadId);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -376,6 +607,28 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
             </select>
             <span className="text-xs text-muted-foreground">Workers get their own worktree of this repo.</span>
           </label>
+          <ExecutionPickerField
+            label="Ariadne model"
+            effective={effectiveAriadne}
+            isCustom={ariadneOverride !== null}
+            defaultTag={hasExecutionOverrides(defaults.ariadne) ? "Plugin default" : "BB default"}
+            resetLabel="Use default"
+            hostId={selectedHostId}
+            disabled={pending}
+            onChange={setAriadneOverride}
+            onReset={() => setAriadneOverride(null)}
+          />
+          <ExecutionPickerField
+            label="Worker model"
+            effective={effectiveWorker}
+            isCustom={workerOverride !== null}
+            defaultTag={hasExecutionOverrides(defaults.worker) ? "Plugin default" : "BB default"}
+            resetLabel="Use default"
+            hostId={selectedHostId}
+            disabled={pending}
+            onChange={setWorkerOverride}
+            onReset={() => setWorkerOverride(null)}
+          />
           <label className="block space-y-1 text-sm">
             <span className="font-medium">Links (optional, one per line)</span>
             <textarea
@@ -604,6 +857,16 @@ function WorkstreamDetail({ name }: { name: string }) {
           </>
         )}
       </div>
+      {ws !== null && (hasExecutionOverrides(ws.ariadneExecution) || hasExecutionOverrides(ws.workerExecution)) ? (
+        <p className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          {formatExecutionSummary(ws.ariadneExecution) ? (
+            <span>Ariadne: {formatExecutionSummary(ws.ariadneExecution)}</span>
+          ) : null}
+          {formatExecutionSummary(ws.workerExecution) ? (
+            <span>Workers: {formatExecutionSummary(ws.workerExecution)}</span>
+          ) : null}
+        </p>
+      ) : null}
       {ws !== null && ws.links.length > 0 ? (
         <p className="mt-2 flex flex-wrap gap-3 text-xs">
           {ws.links.map((link) => (
@@ -756,6 +1019,12 @@ export default definePluginApp((app) => {
     icon: "ariadne/yarn",
     path: PANEL_PATH,
     component: AriadnePage,
+  });
+  app.slots.settingsSection({
+    id: "agents",
+    title: "Agents",
+    description: "Choose the default provider, model, reasoning level, and service tier for Ariadne manager threads and workers.",
+    component: AriadneSettingsSection,
   });
   app.slots.threadPanelAction({
     id: "board",

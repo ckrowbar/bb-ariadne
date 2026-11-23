@@ -1,9 +1,23 @@
 // Types and the RPC contract shared by the server and app.tsx.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { TASK_STATUSES } from "./constants";
+import { REASONING_LEVELS, TASK_STATUSES } from "./constants";
 
-export { CHANGED_CHANNEL, TASK_STATUSES, type TaskStatus } from "./constants";
+export { CHANGED_CHANNEL, REASONING_LEVELS, TASK_STATUSES, type ReasoningLevel, type TaskStatus } from "./constants";
+
+export const executionConfigSchema = z.object({
+  providerId: z.string().nullable(),
+  model: z.string().nullable(),
+  reasoningLevel: z.enum(REASONING_LEVELS).nullable(),
+  serviceTier: z.string().nullable(),
+});
+export type ExecutionConfig = z.infer<typeof executionConfigSchema>;
+
+export const agentDefaultsSchema = z.object({
+  ariadne: executionConfigSchema,
+  worker: executionConfigSchema,
+});
+export type AgentDefaults = z.infer<typeof agentDefaultsSchema>;
 
 const prSchema = z.object({
   number: z.number(),
@@ -45,6 +59,8 @@ const workstreamSchema = z.object({
   projectName: z.string().nullable(),
   links: z.array(z.string()),
   archived: z.boolean(),
+  ariadneExecution: executionConfigSchema,
+  workerExecution: executionConfigSchema,
   counts: z.object({
     running: z.number(),
     blocked: z.number(),
@@ -91,14 +107,24 @@ export const rpcContract = defineRpcContract({
   projects: {
     input: z.null(),
     output: z.object({
-      projects: z.array(z.object({ id: z.string(), name: z.string(), kind: z.string() })),
+      projects: z.array(z.object({ id: z.string(), name: z.string(), kind: z.string(), hostId: z.string().nullable() })),
     }),
+  },
+  agent_defaults_get: {
+    input: z.null(),
+    output: agentDefaultsSchema,
+  },
+  agent_defaults_set: {
+    input: agentDefaultsSchema,
+    output: agentDefaultsSchema,
   },
   workstream_create: {
     input: z.object({
       name: z.string().trim().min(1).max(60),
       projectId: z.string(),
       links: z.array(z.string().trim().min(1)).max(20),
+      ariadne: executionConfigSchema.optional(),
+      worker: executionConfigSchema.optional(),
     }),
     output: z.object({ ariadneThreadId: z.string() }),
   },

@@ -9,8 +9,26 @@ import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { PluginCliError, cliCommand, defineCli } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { boardRow } from "./src/board";
-import { CHANGED_CHANNEL, TASK_STATUSES, rpcContract, type PrSummary, type Task, type Workstream } from "./src/contract";
+import {
+  CHANGED_CHANNEL,
+  REASONING_LEVELS,
+  TASK_STATUSES,
+  rpcContract,
+  type AgentDefaults,
+  type ExecutionConfig,
+  type PrSummary,
+  type ReasoningLevel,
+  type Task,
+  type Workstream,
+} from "./src/contract";
 import { openStore, type WorkstreamRow } from "./src/db";
+import {
+  isReasoningLevel,
+  mergeExecution,
+  normalizeAgentDefaults,
+  normalizeExecution,
+  toSpawnExecutionArgs,
+} from "./src/execution";
 import {
   branchExists,
   branchIsSafeToDelete,
@@ -33,6 +51,7 @@ interface AriadneMetadata {
 }
 
 const HEARTBEAT_CRON = "*/10 * * * *";
+const AGENT_DEFAULTS_KV_KEY = "agent-defaults";
 // BB's sidebar has no per-thread custom icons (row indicators are a fixed
 // set), so titles carry the mark: a ball of yarn for Ariadne, a thread for
 // each worker.
@@ -89,23 +108,6 @@ A draft PR in ${input.repo} with the change, a "## Motivation" section, and open
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    workerProvider: {
-      type: "string",
-      label: "Worker provider",
-      description: "Provider id for worker threads (bb provider list).",
-      default: "claude-code",
-    },
-    workerModel: {
-      type: "string",
-      label: "Worker model",
-      description: "Model for worker threads. Empty uses the provider default.",
-      default: "",
-    },
-    ariadneProvider: {
-      type: "string",
-      label: "Ariadne provider",
-      default: "claude-code",
-    },
     branchConvention: {
       type: "string",
       label: "Branch naming convention",
@@ -149,6 +151,18 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const publish = () => bb.realtime.publish(CHANGED_CHANNEL, { at: Date.now() });
   const workerTurns = new WorkerTurns();
+
+  async function getAgentDefaults(): Promise<AgentDefaults> {
+    const stored = await bb.storage.kv.get<Partial<AgentDefaults>>(AGENT_DEFAULTS_KV_KEY);
+    return normalizeAgentDefaults(stored);
+  }
+
+  async function setAgentDefaults(next: AgentDefaults): Promise<AgentDefaults> {
+    const normalized = normalizeAgentDefaults(next);
+    await bb.storage.kv.set(AGENT_DEFAULTS_KV_KEY, normalized);
+    publish();
+    return normalized;
+  }
 
   async function metadataOf(threadId: string): Promise<AriadneMetadata> {
     return (await bb.sdk.threads.getPluginMetadata({ threadId })) as AriadneMetadata;
@@ -194,9 +208,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---------------------------------------------------------------- actions
 
-  async function createWorkstream(name: string, projectId: string, links: string[]): Promise<string> {
+  async function createWorkstream(
+    name: string,
+    projectId: string,
+    links: string[],
+    execution?: { ariadne?: Partial<ExecutionConfig>; worker?: Partial<ExecutionConfig> },
+  ): Promise<string> {
     if (store.workstream(name) !== undefined) throw new Error(`Workstream "${name}" already exists.`);
-    const source = await projectSource(projectId);
+    const [source, defaults] = await Promise.all([projectSource(projectId), getAgentDefaults()]);
+    const ariadneOverride = normalizeExecution(execution?.ariadne);
+    const workerOverride = normalizeExecution(execution?.worker);
+    const resolvedAriadne = mergeExecution(defaults.ariadne, ariadneOverride);
     // Ariadne reads code in the shared checkout for kickoffs; its instructions
     // forbid editing there. Personal projects get a personal workspace.
     const environment =
@@ -213,11 +235,14 @@ export default async function plugin(bb: BbPluginApi) {
       title: `${ARIADNE_MARK} ${name}`,
       prompt: `${PLUGIN_PREFIX} You are Ariadne for the workstream ${JSON.stringify(name)}. Introduce yourself in two sentences: what you can do, and that the user can hand you tickets here.`,
       pinned: true,
-      providerId: config.ariadneProvider || undefined,
       permissionMode: "full",
+      ...toSpawnExecutionArgs(resolvedAriadne),
       pluginMetadata: { role: "ariadne", workstream: name },
     });
-    store.insertWorkstream(name, thread.id, projectId, links);
+    store.insertWorkstream(name, thread.id, projectId, links, {
+      ariadne: ariadneOverride,
+      worker: workerOverride,
+    });
     store.event("workstream-created", thread.id, name);
     publish();
     return thread.id;
@@ -225,12 +250,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function spawnWorker(
     ariadneThreadId: string,
-    args: { title: string; prompt: string; links?: string[]; model?: string; baseBranch?: string; projectId?: string },
+    args: {
+      title: string;
+      prompt: string;
+      links?: string[];
+      providerId?: string;
+      model?: string;
+      reasoningLevel?: ReasoningLevel;
+      serviceTier?: string;
+      baseBranch?: string;
+      projectId?: string;
+    },
   ): Promise<{ task: Task; note: string }> {
     const ws = store.workstreamByAriadne(ariadneThreadId);
     if (ws === undefined) throw new Error("This Ariadne thread has no workstream record.");
     const projectId = args.projectId ?? ws.project_id;
-    const source = await projectSource(projectId);
+    const [source, defaults] = await Promise.all([projectSource(projectId), getAgentDefaults()]);
     let environment;
     let note = "";
     if (source.kind === "standard" && source.path !== null) {
@@ -246,14 +281,21 @@ export default async function plugin(bb: BbPluginApi) {
     } else {
       environment = { type: "host", workspace: { type: "personal" } } as const;
     }
+    const workstreamWorker = store.workerExecution(ws);
+    const argOverride = normalizeExecution({
+      providerId: args.providerId ?? null,
+      model: args.model ?? null,
+      reasoningLevel: args.reasoningLevel ?? null,
+      serviceTier: args.serviceTier ?? null,
+    });
+    const resolvedWorker = mergeExecution(mergeExecution(defaults.worker, workstreamWorker), argOverride);
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment,
       title: `${WORKER_MARK} ${args.title}`,
       prompt: args.prompt,
-      providerId: config.workerProvider || undefined,
-      model: args.model ?? (config.workerModel || undefined),
       permissionMode: "full",
+      ...toSpawnExecutionArgs(resolvedWorker),
       parentThreadId: ariadneThreadId,
       pluginMetadata: { role: "worker", workstream: ws.name, ariadneThreadId },
     });
@@ -576,6 +618,8 @@ export default async function plugin(bb: BbPluginApi) {
       projectName: await projectName(row.project_id),
       links: store.links(row),
       archived: row.archived_at !== null,
+      ariadneExecution: store.ariadneExecution(row),
+      workerExecution: store.workerExecution(row),
       counts: store.counts(row.name),
     };
   }
@@ -638,7 +682,10 @@ export default async function plugin(bb: BbPluginApi) {
       title: z.string().min(1).max(120).describe("Short task title, e.g. 'CHATINTS-2414 notify on join'"),
       prompt: z.string().min(1).describe("The full kickoff prompt for the worker"),
       links: z.array(z.string()).max(20).optional().describe("Ticket or doc URLs for the board"),
+      providerId: z.string().optional().describe("Provider override for this worker"),
       model: z.string().optional().describe("Model override for this worker"),
+      reasoningLevel: z.enum(REASONING_LEVELS).optional().describe("Reasoning level override for this worker"),
+      serviceTier: z.string().optional().describe("Service tier override for this worker"),
       baseBranch: z.string().optional().describe("Base branch to fork from; defaults to the repo default branch"),
     }),
     async execute(args, { threadId }) {
@@ -929,10 +976,17 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     projects: async () => {
       const projects = await bb.sdk.projects.list({ includePersonal: true });
-      return { projects: projects.map((p) => ({ id: p.id, name: p.name, kind: p.kind })) };
+      return {
+        projects: projects.map((p) => {
+          const source = p.sources.find((s) => s.isDefault) ?? p.sources[0];
+          return { id: p.id, name: p.name, kind: p.kind, hostId: source?.hostId ?? null };
+        }),
+      };
     },
-    workstream_create: async ({ name, projectId, links }) => ({
-      ariadneThreadId: await createWorkstream(name, projectId, links),
+    agent_defaults_get: async () => getAgentDefaults(),
+    agent_defaults_set: async (next) => setAgentDefaults(next),
+    workstream_create: async ({ name, projectId, links, ariadne, worker }) => ({
+      ariadneThreadId: await createWorkstream(name, projectId, links, { ariadne, worker }),
     }),
     workstream_archive: async ({ name }) => {
       const ws = store.workstream(name);
@@ -975,13 +1029,55 @@ export default async function plugin(bb: BbPluginApi) {
           options: {
             project: { type: "string", description: "Project id (defaults to the invoking thread's project)" },
             link: { type: "string", repeatable: true, description: "Link to attach (repeatable)" },
+            provider: { type: "string", description: "Provider id for the Ariadne thread" },
+            model: { type: "string", description: "Model id for the Ariadne thread" },
+            "reasoning-level": {
+              type: "string",
+              description: `Reasoning level for the Ariadne thread (${REASONING_LEVELS.join(", ")})`,
+            },
+            "service-tier": { type: "string", description: "Service tier for the Ariadne thread" },
+            "worker-provider": { type: "string", description: "Default provider id for workers in this workstream" },
+            "worker-model": { type: "string", description: "Default model id for workers in this workstream" },
+            "worker-reasoning-level": {
+              type: "string",
+              description: `Default reasoning level for workers in this workstream (${REASONING_LEVELS.join(", ")})`,
+            },
+            "worker-service-tier": { type: "string", description: "Default service tier for workers in this workstream" },
           },
           async run(input, ctx) {
             const projectId = input.options.project ?? ctx.projectId;
             if (projectId === undefined) {
               throw new PluginCliError("no project", { code: "missing_project", hint: "Pass --project <id> (bb project list)." });
             }
-            const id = await createWorkstream(input.positionals.workstream, projectId, [input.options.link ?? []].flat());
+            const parseReasoning = (raw: string | undefined, flag: string): ReasoningLevel | null => {
+              if (raw === undefined || raw.trim() === "") return null;
+              const trimmed = raw.trim();
+              if (!isReasoningLevel(trimmed)) {
+                throw new PluginCliError(`invalid ${flag}: ${trimmed}`, {
+                  code: "invalid_reasoning_level",
+                  hint: `Valid values: ${REASONING_LEVELS.join(", ")}`,
+                });
+              }
+              return trimmed;
+            };
+            const ariadne: ExecutionConfig = {
+              providerId: input.options.provider ?? null,
+              model: input.options.model ?? null,
+              reasoningLevel: parseReasoning(input.options["reasoning-level"], "--reasoning-level"),
+              serviceTier: input.options["service-tier"] ?? null,
+            };
+            const worker: ExecutionConfig = {
+              providerId: input.options["worker-provider"] ?? null,
+              model: input.options["worker-model"] ?? null,
+              reasoningLevel: parseReasoning(input.options["worker-reasoning-level"], "--worker-reasoning-level"),
+              serviceTier: input.options["worker-service-tier"] ?? null,
+            };
+            const id = await createWorkstream(
+              input.positionals.workstream,
+              projectId,
+              [input.options.link ?? []].flat(),
+              { ariadne, worker },
+            );
             return { exitCode: 0, stdout: `Created Ariadne ${id} for "${input.positionals.workstream}".` };
           },
         }),

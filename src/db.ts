@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { TaskStatus } from "./constants";
 import type { Note, PrSummary, StagingEntry, Task } from "./contract";
+import { parseExecutionJson, serializeExecutionJson, type ExecutionConfig } from "./execution.ts";
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 
@@ -13,6 +14,8 @@ export interface WorkstreamRow {
   ariadne_thread_id: string;
   project_id: string;
   links_json: string;
+  ariadne_execution_json: string | null;
+  worker_execution_json: string | null;
   archived_at: number | null;
   created_at: number;
 }
@@ -114,6 +117,8 @@ const MIGRATIONS = [
      text TEXT NOT NULL,
      source_thread_id TEXT,
      created_at INTEGER NOT NULL)`,
+  `ALTER TABLE workstreams ADD COLUMN ariadne_execution_json TEXT`,
+  `ALTER TABLE workstreams ADD COLUMN worker_execution_json TEXT`,
 ];
 
 function parseLinks(json: string): string[] {
@@ -161,10 +166,25 @@ export function openStore(bb: BbPluginApi) {
     workstreams(): WorkstreamRow[] {
       return db.prepare("SELECT * FROM workstreams ORDER BY archived_at IS NOT NULL, created_at DESC").all() as WorkstreamRow[];
     },
-    insertWorkstream(name: string, ariadneThreadId: string, projectId: string, links: string[]) {
+    insertWorkstream(
+      name: string,
+      ariadneThreadId: string,
+      projectId: string,
+      links: string[],
+      execution?: { ariadne?: Partial<ExecutionConfig> | null; worker?: Partial<ExecutionConfig> | null },
+    ) {
       db.prepare(
-        "INSERT INTO workstreams (name, ariadne_thread_id, project_id, links_json, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).run(name, ariadneThreadId, projectId, JSON.stringify(links), Date.now());
+        `INSERT INTO workstreams (name, ariadne_thread_id, project_id, links_json, ariadne_execution_json, worker_execution_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        name,
+        ariadneThreadId,
+        projectId,
+        JSON.stringify(links),
+        serializeExecutionJson(execution?.ariadne),
+        serializeExecutionJson(execution?.worker),
+        Date.now(),
+      );
     },
     archiveWorkstream(name: string) {
       db.prepare("UPDATE workstreams SET archived_at = ? WHERE name = ? AND archived_at IS NULL").run(Date.now(), name);
@@ -190,6 +210,12 @@ export function openStore(bb: BbPluginApi) {
     },
     links(row: WorkstreamRow): string[] {
       return parseLinks(row.links_json);
+    },
+    ariadneExecution(row: WorkstreamRow): ExecutionConfig {
+      return parseExecutionJson(row.ariadne_execution_json);
+    },
+    workerExecution(row: WorkstreamRow): ExecutionConfig {
+      return parseExecutionJson(row.worker_execution_json);
     },
 
     // Tasks
