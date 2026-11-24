@@ -1,16 +1,16 @@
-// Host git operations. v0 assumes the BB server and the project checkout share
-// a machine (see docs/v0-spec.md, out of scope), so these run with
-// node:child_process on the server.
+// Host git and GitHub API operations. Assumes the BB server and project
+// checkout share a machine, so git/check commands run via node:child_process.
 //
 // Why HTTPS: BB refreshes a worktree base with `git fetch origin`, which goes
 // over SSH. On a Datadog workspace SSH only works while the user's laptop
-// forwards its agent. A ddtool token over HTTPS works unattended, the same way
-// the workspace commit helper pushes.
+// forwards its agent. A ddtool token over HTTPS works unattended, and also
+// powers zero-token external PR watches without LLM bash loops.
 import { execFile } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import type { ExternalPrState, GitHubPrRef } from "./watches.ts";
 
 const run = promisify(execFile);
 const DDTOOL_CANDIDATES = ["ddtool", "/opt/dogbrew/bin/ddtool"];
@@ -33,7 +33,7 @@ async function gitOk(repoPath: string, args: string[]): Promise<boolean> {
   }
 }
 
-/** "git@ddoghq.github.com:ddoghq/dd-source.git" → { owner: "ddoghq", repo: "dd-source" } */
+/** "git@ddoghq.github.com:ddoghq/dd-source.git" -> { owner: "ddoghq", repo: "dd-source" } */
 export function parseGitHubRemote(url: string | null): { owner: string; repo: string } | null {
   if (url === null) return null;
   const match = /[:/]([^/:]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url.trim());
@@ -100,7 +100,7 @@ export async function refreshBase(repoPath: string, remoteUrl: string | null, br
           "fetch",
           "--quiet",
           "--no-tags",
-          // The https:: helper syntax bypasses the user's https → SSH insteadOf rules.
+          // The https:: helper syntax bypasses the user's https -> SSH insteadOf rules.
           `https::https://github.com/${remote.owner}/${remote.repo}.git`,
           `+refs/heads/${branch}:${localRef}`,
         ],
@@ -120,6 +120,95 @@ export async function refreshBase(repoPath: string, remoteUrl: string | null, br
   }
   const sha = await git(repoPath, ["rev-parse", "--verify", localRef]);
   return { sha, fresh: warning === null, warning };
+}
+
+/**
+ * Fetches an external PR's merge and check-runs state via GitHub REST API
+ * using the same org-scoped token path as refreshBase.
+ */
+export async function fetchGitHubPr(ref: GitHubPrRef): Promise<ExternalPrState> {
+  const token = await githubToken(ref.owner);
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "User-Agent": "bb-plugin-ariadne",
+  };
+  const prRes = await fetch(`https://api.github.com/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`, {
+    headers,
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!prRes.ok) {
+    throw new Error(`GitHub PR ${ref.owner}/${ref.repo}#${ref.number} returned HTTP ${prRes.status}`);
+  }
+  const prJson = (await prRes.json()) as {
+    number: number;
+    html_url: string;
+    state: string;
+    merged: boolean;
+    head?: { sha?: string };
+  };
+  const state: ExternalPrState["state"] = prJson.merged ? "merged" : prJson.state === "closed" ? "closed" : "open";
+  let passedCount = 0;
+  let failedCount = 0;
+  let pendingCount = 0;
+  let checksState: ExternalPrState["checksState"] = "unknown";
+
+  const sha = prJson.head?.sha;
+  if (typeof sha === "string" && sha !== "") {
+    const checksRes = await fetch(
+      `https://api.github.com/repos/${ref.owner}/${ref.repo}/commits/${sha}/check-runs?per_page=100`,
+      { headers, signal: AbortSignal.timeout(20_000) },
+    );
+    if (checksRes.ok) {
+      const checksJson = (await checksRes.json()) as {
+        check_runs?: { status?: string; conclusion?: string | null }[];
+      };
+      const runs = checksJson.check_runs ?? [];
+      for (const r of runs) {
+        if (r.status !== "completed") {
+          pendingCount++;
+        } else if (r.conclusion === "success" || r.conclusion === "neutral" || r.conclusion === "skipped") {
+          passedCount++;
+        } else {
+          failedCount++;
+        }
+      }
+      if (runs.length === 0) checksState = "no_checks";
+      else if (failedCount > 0) checksState = "failing";
+      else if (pendingCount > 0) checksState = "pending";
+      else checksState = "passing";
+    }
+  }
+
+  return {
+    number: prJson.number,
+    url: prJson.html_url,
+    state,
+    checksState,
+    failedCount,
+    pendingCount,
+    passedCount,
+  };
+}
+
+/** Runs a bounded shell condition check for a `command` watch (exit 0 = ready). */
+export async function runCheckCommand(
+  cwd: string,
+  command: string,
+  timeoutMs = 30_000,
+): Promise<{ ok: boolean; output: string }> {
+  try {
+    const { stdout, stderr } = await run("/bin/sh", ["-lc", command], {
+      cwd,
+      timeout: timeoutMs,
+      maxBuffer: 256 * 1024,
+    });
+    return { ok: true, output: (stdout || stderr).trim().slice(0, 1000) };
+  } catch (error) {
+    const err = error as { stdout?: string; stderr?: string; message?: string };
+    const text = (err.stdout || err.stderr || err.message || "failed").trim().slice(0, 400);
+    return { ok: false, output: text };
+  }
 }
 
 /** The checkout's origin URL. BB records a project's remote once, so it goes stale after a repo rename. */
