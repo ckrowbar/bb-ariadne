@@ -1,9 +1,42 @@
 // Types and the RPC contract shared by the server and app.tsx.
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { REASONING_LEVELS, TASK_STATUSES } from "./constants";
+import {
+  DEPENDS_MODES,
+  REASONING_LEVELS,
+  RUN_PHASES,
+  RUN_ROLES,
+  RUN_STATUSES,
+  TASK_ATTENTION_LANES,
+  TASK_STATUSES,
+  VERIFY_MODES,
+  WATCH_KINDS,
+  WATCH_STATUSES,
+} from "./constants.ts";
 
-export { CHANGED_CHANNEL, REASONING_LEVELS, TASK_STATUSES, type ReasoningLevel, type TaskStatus } from "./constants";
+export {
+  CHANGED_CHANNEL,
+  DEPENDS_MODES,
+  REASONING_LEVELS,
+  RUN_PHASES,
+  RUN_ROLES,
+  RUN_STATUSES,
+  TASK_ATTENTION_LANES,
+  TASK_STATUSES,
+  VERIFY_MODES,
+  WATCH_KINDS,
+  WATCH_STATUSES,
+  type DependsMode,
+  type ReasoningLevel,
+  type RunPhase,
+  type RunRole,
+  type RunStatus,
+  type TaskAttentionLane,
+  type TaskStatus,
+  type VerifyMode,
+  type WatchKind,
+  type WatchStatus,
+} from "./constants.ts";
 
 export const executionConfigSchema = z.object({
   providerId: z.string().nullable(),
@@ -31,8 +64,43 @@ const prSchema = z.object({
     failed: z.number(),
     pending: z.number(),
   }),
+  updatedAt: z.string().nullable().optional(),
+  reviewState: z.string().nullable().optional(),
+  mergeableState: z.string().nullable().optional(),
 });
 export type PrSummary = z.infer<typeof prSchema>;
+
+export const taskRunSchema = z.object({
+  id: z.number(),
+  taskId: z.string(),
+  workstream: z.string(),
+  runNumber: z.number(),
+  role: z.enum(RUN_ROLES),
+  phase: z.enum(RUN_PHASES),
+  threadId: z.string(),
+  status: z.enum(RUN_STATUSES),
+  summary: z.string().nullable(),
+  contextTokens: z.number().nullable(),
+  startedAt: z.number(),
+  endedAt: z.number().nullable(),
+});
+export type TaskRun = z.infer<typeof taskRunSchema>;
+
+export const watchSchema = z.object({
+  id: z.string(),
+  workstream: z.string(),
+  taskId: z.string(),
+  kind: z.enum(WATCH_KINDS),
+  target: z.string(),
+  resumePrompt: z.string(),
+  status: z.enum(WATCH_STATUSES),
+  lastCheckedAt: z.number().nullable(),
+  lastState: z.string().nullable(),
+  expiresAt: z.number().nullable(),
+  createdAt: z.number(),
+  triggeredAt: z.number().nullable(),
+});
+export type Watch = z.infer<typeof watchSchema>;
 
 const taskSchema = z.object({
   id: z.string(),
@@ -47,10 +115,28 @@ const taskSchema = z.object({
   pr: prSchema.nullable(),
   summary: z.string().nullable(),
   harvested: z.boolean(),
+  prompt: z.string().nullable(),
+  baseBranch: z.string().nullable(),
+  projectId: z.string().nullable(),
+  execution: executionConfigSchema,
+  dependsOn: z.array(z.string()),
+  dependsMode: z.enum(DEPENDS_MODES),
+  verifyMode: z.enum(VERIFY_MODES),
+  handoff: z.string().nullable(),
+  reactionCounts: z.record(z.string(), z.number()),
+  contextTokens: z.number().nullable(),
   createdAt: z.number(),
   updatedAt: z.number(),
 });
 export type Task = z.infer<typeof taskSchema>;
+
+export const boardTaskSchema = taskSchema.extend({
+  attention: z.enum(TASK_ATTENTION_LANES),
+  attentionReason: z.string().nullable(),
+  runs: z.array(taskRunSchema),
+  watches: z.array(watchSchema),
+});
+export type BoardTask = z.infer<typeof boardTaskSchema>;
 
 const workstreamSchema = z.object({
   name: z.string(),
@@ -62,7 +148,10 @@ const workstreamSchema = z.object({
   ariadneExecution: executionConfigSchema,
   workerExecution: executionConfigSchema,
   counts: z.object({
+    queued: z.number(),
     running: z.number(),
+    verifying: z.number(),
+    waiting: z.number(),
     blocked: z.number(),
     inReview: z.number(),
     done: z.number(),
@@ -140,9 +229,13 @@ export const rpcContract = defineRpcContract({
     input: z.object({ name: z.string() }),
     output: z.object({ ok: z.boolean(), detail: z.string() }),
   },
+  workstream_compact: {
+    input: z.object({ name: z.string() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
+  },
   board: {
     input: z.object({ workstream: z.string() }),
-    output: z.object({ tasks: z.array(taskSchema) }),
+    output: z.object({ tasks: z.array(boardTaskSchema) }),
   },
   task_drop_preview: {
     input: z.object({ taskId: z.string() }),
@@ -150,6 +243,22 @@ export const rpcContract = defineRpcContract({
   },
   task_drop: {
     input: z.object({ taskId: z.string() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
+  },
+  task_dispatch_now: {
+    input: z.object({ taskId: z.string() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
+  },
+  task_rotate: {
+    input: z.object({ taskId: z.string(), reason: z.string().max(500).optional() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
+  },
+  task_verify: {
+    input: z.object({ taskId: z.string(), focus: z.string().max(1000).optional() }),
+    output: z.object({ ok: z.boolean(), detail: z.string() }),
+  },
+  watch_cancel: {
+    input: z.object({ watchId: z.string() }),
     output: z.object({ ok: z.boolean(), detail: z.string() }),
   },
   notes: {
@@ -163,7 +272,7 @@ export const rpcContract = defineRpcContract({
   thread_context: {
     input: z.object({ threadId: z.string() }),
     output: z.object({
-      role: z.enum(["ariadne", "worker", "none"]),
+      role: z.enum(["ariadne", "worker", "verifier", "none"]),
       workstream: z.string().nullable(),
       taskId: z.string().nullable(),
     }),

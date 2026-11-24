@@ -1,11 +1,10 @@
 // bb-plugin-ariadne — frontend entry.
 //
-// Every key human interaction is a click here (docs/v0-spec.md, UI):
+// Human interactions live in the BB app:
 // - Ariadne sidebar page: workstreams, New workstream, and per workstream the
-//   Board, Notes and Staging tabs.
-// - "Ariadne board" thread panel: the same board beside a Ariadne or worker chat.
+//   Board (with watches, run/verifier history, and controls), Notes and Staging tabs.
+// - "Ariadne board" thread panel: the same board beside an Ariadne, worker or verifier chat.
 // - Home page section: each active workstream with task counts.
-// Data comes over plugin RPC; the server's realtime signal refreshes views.
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
@@ -23,11 +22,11 @@ import type { ExperimentalProviderModelPickerValue, PluginThreadPanelProps } fro
 import { toast } from "sonner";
 import type {
   AgentDefaults,
+  BoardTask,
   DeletionPreview,
   ExecutionConfig,
   Note,
   StagingEntry,
-  Task,
   Workstream,
   rpcContract,
 } from "./src/contract";
@@ -81,6 +80,11 @@ function relativeTime(ms: number): string {
   return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
 }
 
+function formatTokens(tokens: number | null): string | null {
+  if (tokens === null || tokens <= 0) return null;
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k tok` : `${tokens} tok`;
+}
+
 function EmptyState({ children }: { children: ReactNode }) {
   return (
     <div
@@ -101,7 +105,10 @@ function ErrorLine({ error }: { error: string | null }) {
 }
 
 const STATUS_STYLE: Record<TaskStatus, string> = {
+  queued: "bg-muted text-foreground",
   running: "bg-primary/15 text-primary",
+  verifying: "bg-accent text-accent-foreground",
+  waiting: "bg-secondary text-muted-foreground",
   blocked: "bg-destructive/15 text-destructive",
   "in-review": "bg-secondary text-secondary-foreground",
   done: "bg-muted text-muted-foreground",
@@ -116,7 +123,7 @@ function Pill({ className, children }: { className?: string; children: ReactNode
   );
 }
 
-function PrBadge({ task }: { task: Task }) {
+function PrBadge({ task }: { task: BoardTask }) {
   if (task.pr === null) {
     return task.prUrl === null ? (
       <span className="text-xs text-muted-foreground">No PR</span>
@@ -151,8 +158,10 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const { data, error, refetch } = useLive(() => rpc.call("board", { workstream }), [rpc, workstream]);
-  const [dropping, setDropping] = useState<Task | null>(null);
+  const [dropping, setDropping] = useState<BoardTask | null>(null);
   const [risk, setRisk] = useState<string | null | undefined>(undefined);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
   useEffect(() => {
     setRisk(undefined);
     if (dropping === null) return;
@@ -162,6 +171,19 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
     );
   }, [dropping, rpc]);
   const [showClosed, setShowClosed] = useState(false);
+
+  const runAction = async (key: string, fn: () => Promise<{ detail: string }>) => {
+    setBusyAction(key);
+    try {
+      const res = await fn();
+      toast.success(res.detail);
+      refetch();
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyAction(null);
+    }
+  };
 
   if (data === null) return error === null ? <EmptyState>Loading board…</EmptyState> : <ErrorLine error={error} />;
   const visible = data.tasks.filter((t) => showClosed || (t.status !== "done" && t.status !== "dropped"));
@@ -173,38 +195,180 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
         <EmptyState>No open tasks. Hand Ariadne a ticket in its thread.</EmptyState>
       ) : (
         <ul className="divide-y divide-border overflow-hidden rounded-lg border border-border bg-card">
-          {visible.map((task) => (
-            <li key={task.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 text-sm">
-              <Pill className={STATUS_STYLE[task.status]}>{task.status}</Pill>
-              <button
-                type="button"
-                className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
-                disabled={task.workerThreadId === null}
-                onClick={() => task.workerThreadId !== null && navigate.toThread(task.workerThreadId)}
-                title="Open the worker thread"
-              >
-                {task.title}
-              </button>
-              <PrBadge task={task} />
-              {compact ? null : (
-                <span className="hidden text-xs text-muted-foreground md:inline">{relativeTime(task.updatedAt)}</span>
-              )}
-              {task.status === "done" || task.status === "dropped" ? null : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-muted-foreground"
-                  onClick={() => setDropping(task)}
-                  aria-label={`Drop ${task.title}`}
-                >
-                  Drop
-                </Button>
-              )}
-              {task.summary === null || compact ? null : (
-                <p className="w-full text-xs text-muted-foreground">{task.summary}</p>
-              )}
-            </li>
-          ))}
+          {visible.map((task) => {
+            const activeWatches = task.watches.filter((w) => w.status === "active");
+            const tokLabel = formatTokens(task.contextTokens);
+            const isExpanded = expandedId === task.id;
+            const isOpen = task.status !== "done" && task.status !== "dropped";
+            return (
+              <li key={task.id} className="px-3 py-2.5 text-sm">
+                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                  <Pill className={STATUS_STYLE[task.status]}>{task.status}</Pill>
+                  {task.attention === "needs-you" && task.attentionReason && task.status !== "blocked" ? (
+                    <Pill className="bg-destructive/15 text-destructive">{task.attentionReason}</Pill>
+                  ) : task.attention === "ready-to-merge" ? (
+                    <Pill className="bg-primary/15 text-primary">ready to merge</Pill>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate text-left font-medium hover:underline disabled:no-underline"
+                    disabled={task.workerThreadId === null}
+                    onClick={() => task.workerThreadId !== null && navigate.toThread(task.workerThreadId)}
+                    title={task.workerThreadId ? "Open the active worker thread" : "Task is queued"}
+                  >
+                    {task.title}
+                  </button>
+                  <PrBadge task={task} />
+                  {compact ? null : (
+                    <span className="hidden text-xs text-muted-foreground md:inline">{relativeTime(task.updatedAt)}</span>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs text-muted-foreground"
+                    onClick={() => setExpandedId(isExpanded ? null : task.id)}
+                  >
+                    {isExpanded ? "Hide" : "More"}
+                  </Button>
+                  {isOpen ? (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 px-2 text-xs text-muted-foreground"
+                      onClick={() => setDropping(task)}
+                      aria-label={`Drop ${task.title}`}
+                    >
+                      Drop
+                    </Button>
+                  ) : null}
+                </div>
+
+                {(task.dependsOn.length > 0 || activeWatches.length > 0 || tokLabel || task.runs.length > 1) && (
+                  <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                    {task.dependsOn.length > 0 ? <span>deps: {task.dependsOn.join(", ")}</span> : null}
+                    {activeWatches.length > 0 ? (
+                      <span>
+                        watching: {activeWatches.map((w) => `${w.kind} ${w.target}${w.lastState ? ` (${w.lastState})` : ""}`).join(" · ")}
+                      </span>
+                    ) : null}
+                    {tokLabel ? <span>{tokLabel}</span> : null}
+                    {task.runs.length > 1 ? <span>{task.runs.length} runs</span> : null}
+                  </div>
+                )}
+
+                {task.summary === null || compact ? null : (
+                  <p className="mt-1 text-xs text-muted-foreground">{task.summary}</p>
+                )}
+
+                {isExpanded ? (
+                  <div className="mt-2.5 space-y-2.5 rounded-md border border-border bg-background/60 p-2.5 text-xs">
+                    {isOpen ? (
+                      <div className="flex flex-wrap gap-1.5">
+                        {task.status === "queued" ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs"
+                            disabled={busyAction !== null}
+                            onClick={() =>
+                              void runAction(`dispatch:${task.id}`, () => rpc.call("task_dispatch_now", { taskId: task.id }))
+                            }
+                          >
+                            Run now
+                          </Button>
+                        ) : null}
+                        {task.workerThreadId !== null && task.status !== "verifying" ? (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              disabled={busyAction !== null}
+                              onClick={() =>
+                                void runAction(`verify:${task.id}`, () => rpc.call("task_verify", { taskId: task.id }))
+                              }
+                            >
+                              Verify
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 text-xs"
+                              disabled={busyAction !== null}
+                              onClick={() =>
+                                void runAction(`rotate:${task.id}`, () => rpc.call("task_rotate", { taskId: task.id }))
+                              }
+                            >
+                              Rotate run
+                            </Button>
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+
+                    {activeWatches.length > 0 ? (
+                      <div>
+                        <p className="font-medium text-foreground">Active watches</p>
+                        <ul className="mt-1 space-y-1">
+                          {activeWatches.map((w) => (
+                            <li key={w.id} className="flex items-center justify-between gap-2">
+                              <span className="min-w-0 truncate text-muted-foreground">
+                                {w.kind} <span className="font-mono">{w.target}</span>
+                                {w.lastState ? ` · ${w.lastState}` : ""}
+                              </span>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-1.5 text-xs text-muted-foreground"
+                                disabled={busyAction !== null}
+                                onClick={() =>
+                                  void runAction(`watch:${w.id}`, () => rpc.call("watch_cancel", { watchId: w.id }))
+                                }
+                              >
+                                Cancel
+                              </Button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    {task.runs.length > 0 ? (
+                      <div>
+                        <p className="font-medium text-foreground">Run history</p>
+                        <ul className="mt-1 space-y-1">
+                          {task.runs.map((run) => (
+                            <li key={run.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                              <button
+                                type="button"
+                                className="font-medium text-foreground hover:underline"
+                                onClick={() => navigate.toThread(run.threadId)}
+                              >
+                                #{run.runNumber} {run.role}/{run.phase}
+                              </button>
+                              <span className="text-muted-foreground">[{run.status}]</span>
+                              {formatTokens(run.contextTokens) ? (
+                                <span className="text-muted-foreground">{formatTokens(run.contextTokens)}</span>
+                              ) : null}
+                              <span className="text-muted-foreground">{relativeTime(run.startedAt)}</span>
+                              {run.summary ? <span className="w-full text-muted-foreground">{run.summary}</span> : null}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    {task.handoff ? (
+                      <div>
+                        <p className="font-medium text-foreground">Handoff</p>
+                        <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">{task.handoff}</p>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
       {closedCount > 0 ? (
@@ -217,8 +381,8 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
           <DialogHeader>
             <DialogTitle>Drop “{dropping?.title}”?</DialogTitle>
             <DialogDescription>
-              This archives the worker thread. BB removes its worktree about five minutes later. Branches with
-              unpushed commits are kept.
+              This archives the worker thread and cancels its watches. BB removes its worktree about five minutes later.
+              Branches with unpushed commits are kept.
             </DialogDescription>
           </DialogHeader>
           {risk === undefined ? (
@@ -502,7 +666,7 @@ function AriadneSettingsSection() {
       />
       <ExecutionPickerField
         label="Workers"
-        description="Default for worker threads unless overridden on a workstream or task."
+        description="Default for worker and verifier threads unless overridden on a workstream or task."
         effective={defaults.worker}
         isCustom={hasExecutionOverrides(defaults.worker)}
         defaultTag="BB default"
@@ -704,7 +868,7 @@ function DeleteWorkstreamDialog({ name, onClose, onDeleted }: { name: string | n
               <li>Deletes the Ariadne thread and its worker threads, or archives it if BB refuses.</li>
               <li>
                 Removes {preview.tasks} {preview.tasks === 1 ? "task" : "tasks"}, {preview.notes}{" "}
-                {preview.notes === 1 ? "note" : "notes"} and the audit trail. The staging log is kept.
+                {preview.notes === 1 ? "note" : "notes"}, watches, run history and the audit trail. The staging log is kept.
               </li>
             </ul>
             {preview.risks.length === 0 ? null : (
@@ -738,6 +902,9 @@ function Counts({ ws }: { ws: Workstream }) {
   return (
     <span className="flex flex-wrap gap-1.5">
       <Pill className={STATUS_STYLE.running}>{ws.counts.running} running</Pill>
+      {ws.counts.verifying > 0 ? <Pill className={STATUS_STYLE.verifying}>{ws.counts.verifying} verifying</Pill> : null}
+      {ws.counts.waiting > 0 ? <Pill className={STATUS_STYLE.waiting}>{ws.counts.waiting} waiting</Pill> : null}
+      {ws.counts.queued > 0 ? <Pill className={STATUS_STYLE.queued}>{ws.counts.queued} queued</Pill> : null}
       {ws.counts.blocked > 0 ? <Pill className={STATUS_STYLE.blocked}>{ws.counts.blocked} blocked</Pill> : null}
       {ws.counts.inReview > 0 ? <Pill className={STATUS_STYLE["in-review"]}>{ws.counts.inReview} in review</Pill> : null}
     </span>
@@ -758,7 +925,7 @@ function WorkstreamList() {
     <>
       <div className="flex items-center gap-2">
         <p className="flex-1 text-sm text-muted-foreground">
-          One Ariadne per workstream. Hand it tickets in its thread; it runs the workers.
+          One Ariadne per workstream. Hand it tickets in its thread; the orchestrator runs watches, queues and verification.
         </p>
         <Button onClick={() => setCreating(true)}>
           <Icon name="Plus" className="size-4" />
@@ -824,7 +991,20 @@ function WorkstreamDetail({ name }: { name: string }) {
   const [tab, setTab] = useState<Tab>("board");
   const [archiving, setArchiving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [compacting, setCompacting] = useState(false);
   const ws = data?.workstreams.find((w) => w.name === name) ?? null;
+
+  const compactManager = async () => {
+    setCompacting(true);
+    try {
+      const res = await rpc.call("workstream_compact", { name });
+      toast.success(res.detail);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setCompacting(false);
+    }
+  };
 
   return (
     <>
@@ -838,9 +1018,14 @@ function WorkstreamDetail({ name }: { name: string }) {
         {ws === null ? null : (
           <>
             {ws.archived ? null : (
-              <Button variant="outline" size="sm" onClick={() => setArchiving(true)}>
-                Archive
-              </Button>
+              <>
+                <Button variant="outline" size="sm" disabled={compacting} onClick={() => void compactManager()}>
+                  {compacting ? "Compacting…" : "Compact"}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => setArchiving(true)}>
+                  Archive
+                </Button>
+              </>
             )}
             <Button
               variant="ghost"
@@ -910,7 +1095,7 @@ function WorkstreamDetail({ name }: { name: string }) {
           <DialogHeader>
             <DialogTitle>Archive {name}?</DialogTitle>
             <DialogDescription>
-              Archives the Ariadne thread and its workers. Notes and the board stay readable here.
+              Archives the Ariadne thread and its workers and cancels active watches. Notes and the board stay readable here.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -958,7 +1143,7 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
   if (data.role === "none" || data.workstream === null) {
     return (
       <div className="p-3">
-        <EmptyState>This thread is not part of a Ariadne workstream.</EmptyState>
+        <EmptyState>This thread is not part of an Ariadne workstream.</EmptyState>
       </div>
     );
   }
@@ -967,7 +1152,7 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
     <div className="h-full overflow-y-auto p-3">
       <div className="mb-3 flex items-center gap-2">
         <h3 className="flex-1 text-sm font-semibold">{data.workstream}</h3>
-        {data.role === "worker" && ws !== null ? (
+        {(data.role === "worker" || data.role === "verifier") && ws !== null ? (
           <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
             Open Ariadne
           </Button>
