@@ -142,21 +142,31 @@ dd-source is registered as BB project `proj_jqj7vvv6ad`.
 ## Data model (plugin SQLite)
 
 ```sql
-workstreams(name PRIMARY KEY, ariadne_thread_id, links_json, created_at)
+workstreams(name PRIMARY KEY, ariadne_thread_id, project_id, links_json,
+            ariadne_execution_json, worker_execution_json, archived_at, created_at)
 notes(workstream, topic, body, revision, updated_at, PRIMARY KEY (workstream, topic))
 note_revisions(workstream, topic, revision, body, written_by_thread_id, written_at)
 tasks(id PRIMARY KEY, workstream, title, links_json, worker_thread_id,
-      environment_id, status, pr_url, summary, harvested, updated_at)
+      environment_id, branch, status, pr_url, pr_json, summary, harvested,
+      prompt, base_branch, project_id, execution_json, depends_on_json,
+      depends_mode, verify_mode, handoff, reaction_counts_json, context_tokens,
+      created_at, updated_at)
+task_runs(id PRIMARY KEY, task_id, workstream, run_number, role, phase,
+          thread_id, status, summary, context_tokens, started_at, ended_at)
+watches(id PRIMARY KEY, workstream, task_id, kind, target, resume_prompt,
+        status, last_checked_at, last_state, expires_at, created_at, triggered_at)
+turn_state(worker_thread_id PRIMARY KEY, started_by, reported, flagged_streak, updated_at)
 staging_log(id PRIMARY KEY, at, worker_thread_id, task_id, service, branch, purpose)
 events(id PRIMARY KEY, at, workstream, task_id, kind, detail)  -- audit trail
 lessons(id PRIMARY KEY, text, source_thread_id, created_at)    -- retired, unused
 branch_cleanup(environment_id PRIMARY KEY, repo_path, branch, base_ref, attempts, requested_at)
-digest_state(key PRIMARY KEY, signature, updated_at)          -- heartbeat dedupe
+digest_state(key PRIMARY KEY, signature, updated_at)          -- reconciler dedupe
 ```
 
-Task `status`: `running`, `blocked`, `in-review`, `done`, `dropped`. A worker's
-`done` report keeps the task `in-review` while its PR is open; the heartbeat
-moves it to `done` when the PR merges.
+Task `status`: `queued`, `running`, `verifying`, `waiting`, `blocked`, `in-review`, `done`, `dropped`.
+Display attention (`needs-you`, `verifying`, `running`, `waiting`, `queued`, `ready-to-merge`, `in-review`, `done`, `dropped`) is derived at read time from durable facts.
+Active workers keep `parentThreadId` so BB's native sidebar nesting and cascade archive stay intact. When a task rotates to a fresh worker run (phase transition above `workerRotateTokens`, or manual rotate), the new nested worker attaches to the existing worktree via `environment: { type: "reuse", environmentId }` BEFORE the superseded run is stopped and archived, so BB never retires the worktree.
+Clean-context verifiers spawn with `visibility: "hidden"` and no `parentThreadId` on `{ type: "reuse", environmentId }` so they stay out of the sidebar and do not spam Ariadne; past runs and verifiers remain clickable from the task's Run History.
 
 Notes are written only by machines (Ariadne and the plugin). Every write keeps
 the previous revision, so a bad update can be rolled back. Notes hold the
@@ -178,69 +188,91 @@ the spike).
 
 | Tool | Does |
 | --- | --- |
-| `ariadne_spawn_worker(title, prompt, links?, model?, baseBranch?)` | Creates the task row and a child worker in a new managed worktree |
-| `ariadne_board(status?)` | Lists this workstream's tasks: status, harvested, worker, branch, PR and checks state, summary. `bb ariadne board` prints the same row |
-| `ariadne_task_update(taskId, status?, prUrl?, summary?, harvested?)` | Edits a task |
+| `ariadne_spawn_worker(title, prompt, links?, dependsOn?, dependsMode?, verifyMode?, queueOnly?, providerId?, model?, reasoningLevel?, serviceTier?, baseBranch?)` | Creates the task row and spawns a nested child worker, or queues it when dependencies are unfinished or `maxConcurrentWorkers` is reached |
+| `ariadne_board(status?)` | Lists this workstream's tasks: status, deps, watches, context tokens, runs, worker, branch, PR and checks state, summary |
+| `ariadne_task_update(taskId, status?, prUrl?, summary?, handoff?, harvested?, dependsOn?, dependsMode?, verifyMode?)` | Edits a task (validating dependency acyclicity) |
+| `ariadne_steer(taskId, message?, action?, rotate?, model?, reasoningLevel?)` | Steers a worker, rotates to a fresh nested run on the same worktree, switches model/reasoning live, stops, compacts, or dispatches a queued task immediately |
+| `ariadne_session(action, ...)` | Controls Ariadne's own session from chat: status, available models, live model/reasoning/title/pin updates, deferred self-compact/clear-context, workstream worker defaults/links, live orchestrator settings, or detaching back to a normal thread |
+| `ariadne_adopt_worker(threadId, title?, links?)` / `ariadne_detach_worker(taskId)` | Pulls an existing normal thread into this workstream as a tracked nested worker subthread, or releases a worker subthread back into a normal standalone thread |
+| `ariadne_drop_task(taskId, force?)` | Drops a task and archives its worker from chat (refuses if uncommitted/unpushed work exists unless `force=true`) |
+| `ariadne_inspect(taskId)` | Reads bounded live facts: thread status, model, pending interactions, context tokens, last output, diff files, runs, watches, PR state |
+| `ariadne_verify(taskId, focus?)` | Spawns an independent hidden clean-context verifier on the task's worktree |
+| `ariadne_watch(kind, target, resumePrompt, expiresInHours?, taskId?)` / `ariadne_watch_cancel(watchId)` | Registers or cancels a zero-token durable watch (`pr-merged`, `pr-checks`, `task-done`, `timer`, `command`) |
 | `ariadne_notes_read(topic?)` / `ariadne_notes_write(topic, body)` | Reads or replaces a note topic |
 | `ariadne_staging(limit?)` | Lists recent staging log entries across all workstreams |
-| `ariadne_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo (see Self-improvement) |
+| `ariadne_improve(title, problem, evidence?, proposal?)` | Spawns an improvement worker in the plugin repo |
 
 **Worker threads**
 
 | Tool | Does |
 | --- | --- |
-| `ariadne_report(status, note, prUrl?)` | `pr-opened`, `blocked`, `fyi` or `done`. Updates the task and tells Ariadne with `senderThreadId` set |
-| `ariadne_staging_log(service, branch, purpose)` | Records an integration into staging. Workers call it right after `chat-integrate` |
+| `ariadne_report(status, note, prUrl?, handoff?, urgent?)` | `pr-opened`, `blocked`, `fyi` or `done`. `done` triggers the clean-context verifier when enabled; `fyi` logs quietly unless `urgent=true` |
+| `ariadne_watch(kind, target, resumePrompt, expiresInHours?)` | Parks the task in `waiting` on a zero-token watch so the worker ends its turn instead of running bash polling loops |
+| `ariadne_staging_log(service, branch, purpose)` | Records an integration into staging right after `chat-integrate` |
+
+**Verifier threads (hidden, read-only)**
+
+| Tool | Does |
+| --- | --- |
+| `ariadne_verify_verdict(verdict, summary, issues?, checksRun?)` | Settles verification: `pass` advances the task and notifies Ariadne once; `fail` routes findings back to the worker up to `maxVerifyRetries`, then escalates |
 
 Worker instructions explain the protocol and name the Ariadne thread. They do
 not list siblings, because instructions go stale; Ariadne puts siblings in the
 kickoff prompt.
 
-## Events and heartbeat
+## Events and reconciler
 
 | Source | Plugin does |
 | --- | --- |
-| BB `child-completed` | BB delivers it to Ariadne natively (spike finding 1) for every finished worker turn, whoever started it. It does not pass the `message.dispatch` hook, so the plugin cannot drop or label it (README, 2026-11-02) |
-| `message.dispatch` on a worker, `thread.active`, `thread.idle` | The hook records who starts each worker turn: the user typing in the worker thread, or anyone else (Ariadne, the spawn prompt). A turn that goes active with no recorded start was woken by the worker's own background task, such as a CI watcher. When a user or background turn ends, the plugin tells Ariadne just before BB's notice (BB batches it for 2 seconds), once per streak. The streak ends when Ariadne steers the worker or the worker sends a `pr-opened`, `blocked` or `done` report |
+| BB `child-completed` | BB delivers it to Ariadne natively (spike finding 1) for every finished worker turn, whoever started it. Active workers keep `parentThreadId` so sidebar nesting and cascade archive stay intact; hidden verifiers omit `parentThreadId` so they do not clutter the sidebar or notify Ariadne directly |
+| `message.dispatch` on a worker, `thread.active`, `thread.idle` | Persists turn attribution (`user`, `ariadne`, `orchestrator`, or `background`) in SQLite (`turn_state`) so reload never resets streaks. When a user or background turn ends, warns Ariadne once per streak; `ariadne_watch` replaces background polling loops altogether |
+| `thread.failed` on a worker or verifier | If a verifier crashes, marks the run failed and notifies Ariadne; if a worker fails, marks the run failed, flips the task to `blocked`, and notifies Ariadne |
 | `interaction.pending` on a worker | Tells Ariadne at once. An autonomous worker stuck on a permission prompt or question is otherwise invisible |
-| `thread.archived` on a worker | Marks the task `dropped` if still `running`. Warns Ariadne if work is at risk before BB retires the worktree; otherwise queues the local branch for deletion after teardown |
-| `thread.archived` on a Ariadne thread | Marks the workstream archived |
+| `thread.archived` on a worker | Ignores superseded runs archived during worker rotation. For the current active worker, marks the task `dropped` if still `running`/`waiting`/`verifying`, warns Ariadne if work is at risk, and queues local branch cleanup |
+| `thread.archived` on an Ariadne thread | Marks the workstream archived |
 
-**Heartbeat.** A plugin timer that looks for things nobody reports. The checks
-are plain code and cost no model turns:
+**Reconciler (`bb.background.service("reconciler")`).** A continuous, single-flight
+deterministic control loop (default every 60s, plus immediate wake on spawn,
+report, watch, verdict, or settings change) that costs zero model tokens while
+waiting:
 
-- workers idle with task status `running` for over 30 minutes
-- PR changes for worktree workers: checks failing, conflicts, review
-  changes, merged (merged moves an `in-review` task to `done`). Draft,
-  checks-pending and queued PRs are quiet; the worker already reported the PR
-- pending branch cleanups (this runs even while the heartbeat is quiet)
-- `done` tasks not yet harvested into notes
-- staging log entries from different workstreams in the same hour, for the same service
+- **Watches:** evaluates active `pr-merged`, `pr-checks`, `task-done`, `timer`,
+  and `command` watches; wakes the worker (rotating to a fresh nested run first
+  if context is above `workerRotateTokens`) or Ariadne on trigger or expiry
+- **Queue & dependencies:** dispatches `queued` tasks in FIFO order once all
+  `dependsOn` tasks satisfy `dependsMode` (`done` or `pr-opened`) and active
+  slots are below `maxConcurrentWorkers` (`waiting` tasks do not consume slots);
+  escalates if a dependency is `dropped`
+- **Bounded PR reactions:** auto-steers or rotates workers on failing CI
+  (`autoReactCi`), merge conflicts (`autoReactConflicts`), and optionally
+  `changes_requested` (`autoReactReviews`) up to `maxReactionRetries` per PR
+  event, then escalates to Ariadne. Merged PRs move tasks to `done` and
+  re-trigger queue dispatch
+- **Context hygiene:** auto-compacts idle Ariadne manager threads above
+  `managerCompactTokens`, and rotates heavy workers at phase boundaries above
+  `workerRotateTokens`
+- **Stuck / harvest / staging / branch cleanup:** flags workers idle in
+  `running` past `stuckMinutes`, nudges Ariadne on unharvested completions and
+  repeated escalations (including memory, `AGENTS.md`, and workflow review),
+  detects same-hour staging overlaps, and drains pending local branch cleanups
 
-It sends Ariadne one digest only when something changed. It ticks every 10
-minutes while there is activity and stops after 60 minutes with no changes.
-Any spawn, worker report or worker lifecycle event restarts it.
+## Autonomy and continuous self-improvement
 
-## Self-improvement
+Ariadne defaults to maximum safe autonomy and actively compounds improvements
+across four channels:
 
-The user can ask Ariadne to fix or improve itself, and Ariadne suggests it when a
-problem is clearly its own. There are two paths:
-
-- **Memory**, for behaviour that remembering can fix (a preference, a
-  playbook tweak). Ariadne saves it with `bb memory add`. BB's Memory plugin
-  injects a summary index into every thread, and the user reviews or removes
-  memories with BB's own memory tools. This replaced Ariadne's lessons
-  (`ariadne_lesson_add`), which only Ariadne threads could see.
-- **Code**, for anything else. `ariadne_improve` spawns a worker in a managed
-  worktree of the plugin repo (BB project set by the `pluginProjectId` setting;
-  `.bb-env-setup.sh` runs `npm ci`). The worker typechecks, builds, pushes a
-  branch and opens a draft PR in the plugin repo (read from the project's git
-  remote). It never touches the
-  live plugin checkout.
-- **Applying.** Nothing changes until the user merges and asks Ariadne to apply
-  it. Ariadne then pulls the checkout, runs `npm ci` if the lockfile changed,
-  builds and reloads the plugin. A reviewed PR is the guard against Ariadne
-  widening its own permissions.
+- **BB Memory (`bb memory add`):** durable preferences, repo quirks, recurring
+  failure modes, and team conventions learned from completions or escalations
+- **`AGENTS.md` evolution:** when a repo or workspace convention would prevent
+  future friction, Ariadne queues a worker to open a draft PR updating the
+  target repo's `AGENTS.md`, or proposes a concrete diff in chat for global /
+  workspace `AGENTS.md` files (never silently editing outside a PR)
+- **Workflow recommendations:** when recurring bottlenecks appear (repeated CI
+  loops, slow checks, unclear task sizing, missing scripts, or orchestrator
+  tuning), Ariadne surfaces concrete workflow recommendations in chat
+- **Plugin code (`ariadne_improve`):** spawns a worker in a managed worktree of
+  the plugin repo (`pluginProjectId`) to open a draft PR; nothing applies live
+  until the user merges and asks Ariadne to rebuild and reload.
 
 Verified 2026-10-15: a lesson (Haiku for throwaway tasks, since moved to BB
 memory) was followed on the next spawn, and an improvement request produced
@@ -248,13 +280,16 @@ memory) was followed on the next spawn, and an improvement request produced
 
 ## UI
 
-v0 uses stable plugin slots only (`app.slots.navPanel`,
-`app.slots.threadPanelAction`, `app.slots.homepageSection`). Thread links
-open threads through BB navigation.
+v0 uses stable plugin slots (`app.slots.navPanel`,
+`app.slots.settingsSection`, `app.slots.threadPanelAction`,
+`app.slots.homepageSection`) and BB's `experimental_ProviderModelPicker` for
+choosing provider, model, reasoning level and service tier. Thread links open
+threads through BB navigation.
 
 | Human interaction | Where you click |
 | --- | --- |
-| Start a workstream | **Ariadne** sidebar page → **New workstream** (name, optional links). Creates a pinned Ariadne thread and opens it |
+| Configure default models | **Settings** → **Installed plugins** → **Ariadne** → **Agents**: pick default provider, model, reasoning level and service tier for Ariadne threads and workers (stored in plugin KV; reset to inherit BB defaults) |
+| Start a workstream | **Ariadne** sidebar page → **New workstream** (name, project, optional Ariadne and worker model overrides, optional links). Creates a pinned Ariadne thread with those settings and opens it; workers spawned in the workstream inherit its worker selection |
 | Talk to Ariadne, hand it a ticket | The pinned Ariadne thread. Plain chat |
 | See what is going on | **Ariadne** page → workstream → **Board** tab: one row per task with status, PR and CI badges. Click a row to open the worker thread, or the badge to open the PR |
 | Same, without leaving the chat | **Board** thread panel on the Ariadne thread, same rows beside the conversation |
@@ -288,10 +323,19 @@ For agents and scripting.
 
 ```
 bb ariadne create <workstream> [--project <id>] [--link <url>]...
+  [--provider <id>] [--model <id>] [--reasoning-level <level>] [--service-tier <tier>]
+  [--worker-provider <id>] [--worker-model <id>] [--worker-reasoning-level <level>] [--worker-service-tier <tier>]
+bb ariadne adopt [workstream] [--thread <id>] [--link <url>...] [--continue <prompt>] [--no-pin]
+bb ariadne detach [workstream] [--thread <id>]
+bb ariadne adopt-worker <workstream> <threadId> [--title <title>]
+bb ariadne detach-worker <taskId>
 bb ariadne list                      # workstreams and their Ariadne threads
 bb ariadne board <workstream>        # same rows as ariadne_board
 bb ariadne notes <workstream> [topic]
 bb ariadne staging [--limit <n>]
+bb ariadne watches [workstream]      # active durable watches
+bb ariadne runs <taskId>             # worker & verifier run history for a task
+bb ariadne reconcile                 # run one immediate reconciler cycle
 ```
 
 ## Out of scope for v0

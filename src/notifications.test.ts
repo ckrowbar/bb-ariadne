@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import Database from "better-sqlite3";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { openStore } from "./db.ts";
 import { WorkerTurns, prNeedsAttention } from "./notifications.ts";
 
 test("Ariadne hears once per streak of user or background turns", () => {
@@ -10,6 +13,10 @@ test("Ariadne hears once per streak of user or background turns", () => {
   turns.started(w, "ariadne");
   turns.active(w);
   assert.equal(turns.finished(w), null, "a turn Ariadne started");
+
+  turns.started(w, "orchestrator");
+  turns.active(w);
+  assert.equal(turns.finished(w), null, "a turn the orchestrator started");
 
   turns.started(w, "user");
   turns.active(w);
@@ -33,6 +40,26 @@ test("Ariadne hears once per streak of user or background turns", () => {
   assert.equal(turns.finished(w), null, "a steer from Ariadne makes the turn Ariadne's");
   turns.started(w, "user");
   assert.equal(turns.finished(w), "user");
+});
+
+test("SQLite-backed WorkerTurns persists streak state across plugin reloads", () => {
+  const db = new Database(":memory:");
+  const bb = {
+    storage: {
+      database: () => db,
+      migrate: (target: Database.Database, statements: string[]) => statements.forEach((sql) => target.exec(sql)),
+    },
+  } as unknown as BbPluginApi;
+  const store = openStore(bb);
+
+  const beforeReload = new WorkerTurns(store.turnState);
+  beforeReload.started("thr_w1", "user");
+  assert.equal(beforeReload.finished("thr_w1"), "user");
+
+  // Simulate reload: fresh WorkerTurns instance over the same SQLite store.
+  const afterReload = new WorkerTurns(store.turnState);
+  afterReload.started("thr_w1", "user");
+  assert.equal(afterReload.finished("thr_w1"), null, "streak persists after reload");
 });
 
 test("draft and pending PRs stay out of the digest", () => {
