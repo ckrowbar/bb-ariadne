@@ -73,10 +73,11 @@ const PLUGIN_PREFIX = "[ariadne plugin]";
 const ORCHESTRATOR_PREFIX = "[ariadne orchestrator]";
 
 function stripMark(title: string | null | undefined, mark: string): string {
-  const trimmed = (title ?? "").trim();
-  if (trimmed.startsWith(`${mark} `)) return trimmed.slice(mark.length + 1).trim();
-  if (trimmed.startsWith(mark)) return trimmed.slice(mark.length).trim();
-  return trimmed;
+  let value = (title ?? "").trim();
+  while (value.startsWith(mark)) {
+    value = value.slice(mark.length).trim();
+  }
+  return value;
 }
 
 function slugifyWorkstreamName(raw: string, exists: (name: string) => boolean): string {
@@ -616,7 +617,30 @@ export default async function plugin(bb: BbPluginApi) {
     const existingWs = store.workstreamByAriadne(threadId);
     if (existingWs !== undefined) {
       if (existingWs.archived_at !== null) {
+        const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+        const cleanTitle = (
+          stripMark(thread?.title, ARIADNE_MARK) ||
+          opts?.name?.trim() ||
+          store.workstreamTitle(existingWs)
+        ).slice(0, 120);
         store.unarchiveWorkstream(existingWs.name);
+        store.updateWorkstream(existingWs.name, { title: cleanTitle });
+        syncingThreads.add(threadId);
+        try {
+          if (thread !== null && thread.archivedAt === null && thread.deletedAt === null) {
+            await bb.sdk.threads
+              .update({ threadId, title: `${ARIADNE_MARK} ${cleanTitle}` })
+              .catch((err: unknown) => bb.log.warn(`re-adopt ariadne title ${threadId}: ${String(err)}`));
+            if (opts?.pin !== false) {
+              await bb.sdk.threads.pin({ threadId }).catch((err: unknown) => bb.log.warn(`re-adopt ariadne pin ${threadId}: ${String(err)}`));
+            }
+            await bb.sdk.threads
+              .updatePluginMetadata({ threadId, set: { role: "ariadne", workstream: existingWs.name } })
+              .catch((err: unknown) => bb.log.warn(`re-adopt ariadne metadata ${threadId}: ${String(err)}`));
+          }
+        } finally {
+          syncingThreads.delete(threadId);
+        }
         publish();
         const reloadMode = await scheduleOrRunSessionAction(threadId, {
           kind: "reload",
@@ -645,6 +669,13 @@ export default async function plugin(bb: BbPluginApi) {
         : slugifyWorkstreamName(stripMark(thread.title ?? thread.titleFallback ?? threadId, ARIADNE_MARK), (n) => store.workstream(n) !== undefined);
     if (store.workstream(name) !== undefined) throw new Error(`Workstream "${name}" already exists.`);
 
+    const cleanTitle = (
+      stripMark(thread.title, ARIADNE_MARK) ||
+      explicitName ||
+      stripMark(thread.titleFallback, ARIADNE_MARK) ||
+      name
+    ).slice(0, 120);
+
     const execOpts = await bb.sdk.threads.defaultExecutionOptions({ threadId }).catch(() => null);
     const ariadneExec: Partial<ExecutionConfig> = {
       providerId: thread.providerId ?? null,
@@ -653,11 +684,10 @@ export default async function plugin(bb: BbPluginApi) {
       serviceTier: execOpts?.serviceTier ?? null,
     };
 
-    store.insertWorkstream(name, threadId, thread.projectId, opts?.links ?? [], { ariadne: ariadneExec });
+    store.insertWorkstream(name, threadId, thread.projectId, opts?.links ?? [], { ariadne: ariadneExec, title: cleanTitle });
 
     syncingThreads.add(threadId);
     try {
-      const cleanTitle = stripMark(thread.title ?? thread.titleFallback, ARIADNE_MARK) || name;
       await bb.sdk.threads
         .update({ threadId, title: `${ARIADNE_MARK} ${cleanTitle}` })
         .catch((err: unknown) => bb.log.warn(`adopt ariadne title ${threadId}: ${String(err)}`));
@@ -768,9 +798,78 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function syncThreadTitle(thread: {
+    id: string;
+    title: string | null;
+    archivedAt: number | null;
+    deletedAt: number | null;
+    visibility?: string;
+  }) {
+    if (syncingThreads.has(thread.id)) return;
+    if (thread.archivedAt !== null || thread.deletedAt !== null || thread.visibility === "hidden") return;
+    const rawTitle = (thread.title ?? "").trim();
+    if (rawTitle === "") return;
+
+    const ws = store.workstreamByAriadne(thread.id);
+    if (ws !== undefined && ws.archived_at === null) {
+      const cleanTitle = (stripMark(rawTitle, ARIADNE_MARK) || store.workstreamTitle(ws)).slice(0, 120);
+      const expectedTitle = `${ARIADNE_MARK} ${cleanTitle}`;
+      if (rawTitle !== expectedTitle) {
+        syncingThreads.add(thread.id);
+        try {
+          await bb.sdk.threads.update({ threadId: thread.id, title: expectedTitle }).catch((err: unknown) => {
+            bb.log.warn(`preserve ariadne mark ${thread.id}: ${String(err)}`);
+          });
+        } finally {
+          syncingThreads.delete(thread.id);
+        }
+      }
+      if (store.workstreamTitle(ws) !== cleanTitle) {
+        store.updateWorkstream(ws.name, { title: cleanTitle });
+        publish();
+      }
+      return;
+    }
+
+    const task = store.activeTaskByWorker(thread.id);
+    if (task !== undefined && task.status !== "dropped") {
+      const taskWs = store.workstream(task.workstream);
+      if (taskWs === undefined || taskWs.archived_at !== null) return;
+      const cleanTitle = (stripMark(rawTitle, WORKER_MARK) || task.title).slice(0, 120);
+      const expectedTitle = `${WORKER_MARK} ${cleanTitle}`;
+      if (rawTitle !== expectedTitle) {
+        syncingThreads.add(thread.id);
+        try {
+          await bb.sdk.threads.update({ threadId: thread.id, title: expectedTitle }).catch((err: unknown) => {
+            bb.log.warn(`preserve worker mark ${thread.id}: ${String(err)}`);
+          });
+        } finally {
+          syncingThreads.delete(thread.id);
+        }
+      }
+      if (task.title !== cleanTitle) {
+        store.updateTask(task.id, { title: cleanTitle });
+        publish();
+      }
+    }
+  }
+
+  async function reconcileThreadTitleChange(threadId: string) {
+    if (syncingThreads.has(threadId)) return;
+    const ws = store.workstreamByAriadne(threadId);
+    const isActiveManager = ws !== undefined && ws.archived_at === null;
+    const task = isActiveManager ? undefined : store.activeTaskByWorker(threadId);
+    const isActiveWorker = task !== undefined && task.status !== "dropped";
+    if (!isActiveManager && !isActiveWorker) return;
+    const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+    if (thread === null) return;
+    await syncThreadTitle(thread);
+  }
+
   async function syncWorkstreamChildren() {
     const activeWorkstreams = store.workstreams().filter((w) => w.archived_at === null);
     for (const ws of activeWorkstreams) {
+      await reconcileThreadTitleChange(ws.ariadne_thread_id);
       const children = await bb.sdk.threads
         .list({ parentThreadId: ws.ariadne_thread_id, archived: false })
         .catch(() => null);
@@ -783,7 +882,10 @@ export default async function plugin(bb: BbPluginApi) {
           if (store.workstreamByAriadne(child.id) !== undefined) continue;
           if (store.runByThread(child.id)?.role === "verifier") continue;
           const existing = store.activeTaskByWorker(child.id);
-          if (existing !== undefined && existing.workstream === ws.name) continue;
+          if (existing !== undefined && existing.workstream === ws.name) {
+            await syncThreadTitle(child);
+            continue;
+          }
           // Ignore superseded worker runs that haven't finished archiving yet.
           if (store.runByThread(child.id)?.status === "superseded") continue;
           await adoptWorkerThread(ws.name, child.id, { reparent: false, notifyAriadne: true }).catch((err: unknown) => {
@@ -1853,12 +1955,16 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           unsubscribe = bb.sdk.subscribe({
             event: "thread:changed",
             callback(event) {
-              if (
-                event.id !== undefined &&
-                (event.changes.includes("parent-changed") || event.changes.includes("thread-created"))
-              ) {
-                void reconcileThreadParentChange(event.id);
-              }
+              const id = event.id;
+              if (id === undefined) return;
+              const parentChanged =
+                event.changes.includes("parent-changed") || event.changes.includes("thread-created");
+              const titleChanged = event.changes.includes("title-changed");
+              if (!parentChanged && !titleChanged) return;
+              void (async () => {
+                if (parentChanged) await reconcileThreadParentChange(id);
+                if (titleChanged) await reconcileThreadTitleChange(id);
+              })();
             },
           });
         } catch (error) {
@@ -1886,6 +1992,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
   async function workstreamView(row: WorkstreamRow): Promise<Workstream> {
     return {
       name: row.name,
+      title: store.workstreamTitle(row),
       ariadneThreadId: row.ariadne_thread_id,
       projectId: row.project_id,
       projectName: await projectName(row.project_id),
@@ -1938,7 +2045,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         ],
         skills: [],
         instructions: ariadneInstructions({
-          workstream: ws.name,
+          workstream: store.workstreamTitle(ws),
           links: store.links(ws),
           projectName: projectNames.get(ws.project_id) ?? context.project.name,
           pluginCheckout,
@@ -2178,7 +2285,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
       providerId: z.string().optional().describe("For models: filter to one provider id"),
       model: z.string().optional().describe("For update: new model id for this Ariadne thread"),
       reasoningLevel: z.enum(REASONING_LEVELS).optional().describe("For update: new reasoning level for this Ariadne thread"),
-      title: z.string().max(120).optional().describe("For update: new title for this Ariadne thread"),
+      title: z.string().max(120).optional().describe("For update: new display title for this Ariadne thread and workstream"),
       pinned: z.boolean().optional().describe("For update: pin or unpin this Ariadne thread"),
       workerProviderId: z.string().nullable().optional().describe("For set-defaults: default provider for new workers"),
       workerModel: z.string().nullable().optional().describe("For set-defaults: default model for new workers"),
@@ -2215,8 +2322,9 @@ Verify each finding against the original task contract, fix real bugs, re-run te
             bb.sdk.threads.defaultExecutionOptions({ threadId }).catch(() => null),
             readContextTokens(threadId),
           ]);
+          const displayTitle = store.workstreamTitle(ws);
           const lines = [
-            `Workstream: ${ws.name} (thread @thread:${threadId})`,
+            `Workstream: ${displayTitle}${displayTitle !== ws.name ? ` (id: ${ws.name})` : ""} (thread @thread:${threadId})`,
             `Session: provider=${thread?.providerId ?? "?"} model=${execOpts?.model ?? "?"} reasoning=${execOpts?.reasoningLevel ?? "?"} tier=${execOpts?.serviceTier ?? "default"} pinned=${thread?.pinnedAt !== null && thread?.pinnedAt !== undefined}`,
             `Context: ${tokens !== null ? `${tokens.toLocaleString()} tokens` : "unknown"} (auto-compact at ${config.managerCompactTokens.toLocaleString()})`,
             `Workstream worker defaults: ${JSON.stringify(store.workerExecution(ws))}`,
@@ -2251,19 +2359,28 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         if (args.action === "update") {
           const changes: string[] = [];
           const patch: { model?: string; reasoningLevel?: ReasoningLevel; title?: string } = {};
+          let nextDisplayTitle: string | undefined;
           if (args.model !== undefined) patch.model = args.model;
           if (args.reasoningLevel !== undefined) patch.reasoningLevel = args.reasoningLevel;
           if (args.title !== undefined) {
-            const clean = stripMark(args.title, ARIADNE_MARK);
-            patch.title = `${ARIADNE_MARK} ${clean || ws.name}`;
+            nextDisplayTitle = (stripMark(args.title, ARIADNE_MARK) || store.workstreamTitle(ws)).slice(0, 120);
+            patch.title = `${ARIADNE_MARK} ${nextDisplayTitle}`;
           }
           if (Object.keys(patch).length > 0) {
-            await bb.sdk.threads.update({ threadId, ...patch });
+            syncingThreads.add(threadId);
+            try {
+              await bb.sdk.threads.update({ threadId, ...patch });
+            } finally {
+              syncingThreads.delete(threadId);
+            }
             changes.push(
               Object.entries(patch)
                 .map(([k, v]) => `${k}=${v}`)
                 .join(", "),
             );
+          }
+          if (nextDisplayTitle !== undefined) {
+            store.updateWorkstream(ws.name, { title: nextDisplayTitle });
           }
           if (args.model !== undefined || args.reasoningLevel !== undefined) {
             const nextExec = mergeExecution(store.ariadneExecution(ws), {
@@ -2869,25 +2986,33 @@ Verify each finding against the original task contract, fix real bugs, re-run te
             : store.allTasks().filter((t) => store.workstream(t.workstream)?.archived_at === null);
         const needle = query.trim().toLowerCase();
         return pool
-          .filter(
-            (t) =>
-              needle === "" ||
+          .filter((t) => {
+            if (needle === "") return true;
+            const wsRow = store.workstream(t.workstream);
+            const wsLabel = wsRow ? store.workstreamTitle(wsRow) : t.workstream;
+            return (
               t.id.toLowerCase().includes(needle) ||
               t.title.toLowerCase().includes(needle) ||
-              t.workstream.toLowerCase().includes(needle),
-          )
+              t.workstream.toLowerCase().includes(needle) ||
+              wsLabel.toLowerCase().includes(needle)
+            );
+          })
           .slice(0, 15)
-          .map((t) => ({
-            id: t.id,
-            title: `${t.id}: ${t.title}`,
-            subtitle: [
-              ws === undefined ? t.workstream : null,
-              t.status,
-              t.pr ? `#${t.pr.number} ${t.pr.checks.state}` : null,
-            ]
-              .filter(Boolean)
-              .join(" · "),
-          }));
+          .map((t) => {
+            const wsRow = store.workstream(t.workstream);
+            const wsLabel = wsRow ? store.workstreamTitle(wsRow) : t.workstream;
+            return {
+              id: t.id,
+              title: `${t.id}: ${t.title}`,
+              subtitle: [
+                ws === undefined ? wsLabel : null,
+                t.status,
+                t.pr ? `#${t.pr.number} ${t.pr.checks.state}` : null,
+              ]
+                .filter(Boolean)
+                .join(" · "),
+            };
+          });
       },
       resolve(taskId) {
         const task = store.task(taskId);
@@ -3320,7 +3445,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
             const rows = await Promise.all(store.workstreams().map(workstreamView));
             const lines = rows.map(
               (w) =>
-                `${w.name}${w.archived ? " (archived)" : ""}  ariadne=${w.ariadneThreadId}  project=${w.projectName ?? w.projectId}  queued=${w.counts.queued} running=${w.counts.running} verifying=${w.counts.verifying} waiting=${w.counts.waiting} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
+                `${w.title}${w.title !== w.name ? ` (${w.name})` : ""}${w.archived ? " (archived)" : ""}  ariadne=${w.ariadneThreadId}  project=${w.projectName ?? w.projectId}  queued=${w.counts.queued} running=${w.counts.running} verifying=${w.counts.verifying} waiting=${w.counts.waiting} blocked=${w.counts.blocked} in-review=${w.counts.inReview} done=${w.counts.done}`,
             );
             return { exitCode: 0, stdout: lines.length === 0 ? "No workstreams." : lines.join("\n") };
           },

@@ -21,6 +21,7 @@ type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 
 export interface WorkstreamRow {
   name: string;
+  title: string | null;
   ariadne_thread_id: string;
   project_id: string;
   links_json: string;
@@ -219,6 +220,7 @@ const MIGRATIONS = [
      reported INTEGER NOT NULL DEFAULT 0,
      flagged_streak TEXT,
      updated_at INTEGER NOT NULL)`,
+  `ALTER TABLE workstreams ADD COLUMN title TEXT`,
 ];
 
 function parseStringArray(json: string | null | undefined): string[] {
@@ -361,13 +363,15 @@ export function openStore(bb: BbPluginApi) {
       ariadneThreadId: string,
       projectId: string,
       links: string[],
-      execution?: { ariadne?: Partial<ExecutionConfig> | null; worker?: Partial<ExecutionConfig> | null },
+      execution?: { ariadne?: Partial<ExecutionConfig> | null; worker?: Partial<ExecutionConfig> | null; title?: string | null },
     ) {
+      const cleanTitle = execution?.title?.trim() || null;
       db.prepare(
-        `INSERT INTO workstreams (name, ariadne_thread_id, project_id, links_json, ariadne_execution_json, worker_execution_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workstreams (name, title, ariadne_thread_id, project_id, links_json, ariadne_execution_json, worker_execution_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         name,
+        cleanTitle,
         ariadneThreadId,
         projectId,
         JSON.stringify(links),
@@ -375,6 +379,9 @@ export function openStore(bb: BbPluginApi) {
         serializeExecutionJson(execution?.worker),
         Date.now(),
       );
+    },
+    workstreamTitle(row: WorkstreamRow): string {
+      return (row.title ?? "").trim() || row.name;
     },
     archiveWorkstream(name: string) {
       db.prepare("UPDATE workstreams SET archived_at = ? WHERE name = ? AND archived_at IS NULL").run(Date.now(), name);
@@ -385,12 +392,14 @@ export function openStore(bb: BbPluginApi) {
     updateWorkstream(
       name: string,
       changes: Partial<{
+        title: string | null;
         links: string[];
         ariadneExecution: Partial<ExecutionConfig> | null;
         workerExecution: Partial<ExecutionConfig> | null;
       }>,
     ): WorkstreamRow | undefined {
       const columns: Record<string, unknown> = {};
+      if (changes.title !== undefined) columns.title = changes.title?.trim() || null;
       if (changes.links !== undefined) columns.links_json = JSON.stringify(changes.links);
       if (changes.ariadneExecution !== undefined) {
         columns.ariadne_execution_json = serializeExecutionJson(changes.ariadneExecution);

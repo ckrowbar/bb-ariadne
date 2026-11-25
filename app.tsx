@@ -820,7 +820,17 @@ function NewWorkstreamDialog({ open, onOpenChange }: { open: boolean; onOpenChan
 
 // ------------------------------------------------------- delete workstream
 
-function DeleteWorkstreamDialog({ name, onClose, onDeleted }: { name: string | null; onClose: () => void; onDeleted?: () => void }) {
+function DeleteWorkstreamDialog({
+  name,
+  title,
+  onClose,
+  onDeleted,
+}: {
+  name: string | null;
+  title?: string;
+  onClose: () => void;
+  onDeleted?: () => void;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const [preview, setPreview] = useState<DeletionPreview | null>(null);
   const [pending, setPending] = useState(false);
@@ -853,7 +863,7 @@ function DeleteWorkstreamDialog({ name, onClose, onDeleted }: { name: string | n
     <Dialog open={name !== null} onOpenChange={(open) => !open && onClose()}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Delete {name}?</DialogTitle>
+          <DialogTitle>Delete {title ?? name}?</DialogTitle>
           <DialogDescription>This cannot be undone.</DialogDescription>
         </DialogHeader>
         {preview === null ? (
@@ -917,7 +927,7 @@ function WorkstreamList() {
   const { data, error } = useLive(() => rpc.call("overview", null), [rpc]);
   const [creating, setCreating] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
-  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<{ name: string; title: string } | null>(null);
   const workstreams = data?.workstreams.filter((w) => showArchived || !w.archived) ?? null;
   const archivedCount = data?.workstreams.filter((w) => w.archived).length ?? 0;
 
@@ -947,7 +957,7 @@ function WorkstreamList() {
                   className="min-w-0 flex-1 text-left"
                   onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: ws.name })}
                 >
-                  <span className="font-medium hover:underline">{ws.name}</span>
+                  <span className="font-medium hover:underline">{ws.title}</span>
                   <span className="ml-2 text-xs text-muted-foreground">
                     {ws.projectName ?? ws.projectId}
                     {ws.archived ? " · archived" : ""}
@@ -958,8 +968,8 @@ function WorkstreamList() {
                   variant="ghost"
                   size="icon"
                   className="size-8 text-muted-foreground hover:text-destructive"
-                  aria-label={`Delete ${ws.name}`}
-                  onClick={() => setDeleting(ws.name)}
+                  aria-label={`Delete ${ws.title}`}
+                  onClick={() => setDeleting({ name: ws.name, title: ws.title })}
                 >
                   <Icon name="Trash2" className="size-4" />
                 </Button>
@@ -977,7 +987,7 @@ function WorkstreamList() {
         ) : null}
       </div>
       <NewWorkstreamDialog open={creating} onOpenChange={setCreating} />
-      <DeleteWorkstreamDialog name={deleting} onClose={() => setDeleting(null)} />
+      <DeleteWorkstreamDialog name={deleting?.name ?? null} title={deleting?.title} onClose={() => setDeleting(null)} />
     </>
   );
 }
@@ -993,6 +1003,7 @@ function WorkstreamDetail({ name }: { name: string }) {
   const [deleting, setDeleting] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const ws = data?.workstreams.find((w) => w.name === name) ?? null;
+  const displayTitle = ws?.title ?? name;
 
   const compactManager = async () => {
     setCompacting(true);
@@ -1012,7 +1023,7 @@ function WorkstreamDetail({ name }: { name: string }) {
         <Button variant="ghost" size="icon" aria-label="All workstreams" onClick={() => navigate.toPluginPanel(PANEL_PATH)}>
           <Icon name="ArrowLeft" className="size-4" />
         </Button>
-        <h2 className="text-base font-semibold">{name}</h2>
+        <h2 className="text-base font-semibold">{displayTitle}</h2>
         {ws === null ? null : <span className="text-xs text-muted-foreground">{ws.projectName ?? ws.projectId}</span>}
         <span className="flex-1" />
         {ws === null ? null : (
@@ -1031,7 +1042,7 @@ function WorkstreamDetail({ name }: { name: string }) {
               variant="ghost"
               size="icon"
               className="size-8 text-muted-foreground hover:text-destructive"
-              aria-label={`Delete ${name}`}
+              aria-label={`Delete ${displayTitle}`}
               onClick={() => setDeleting(true)}
             >
               <Icon name="Trash2" className="size-4" />
@@ -1093,7 +1104,7 @@ function WorkstreamDetail({ name }: { name: string }) {
       <Dialog open={archiving} onOpenChange={setArchiving}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Archive {name}?</DialogTitle>
+            <DialogTitle>Archive {displayTitle}?</DialogTitle>
             <DialogDescription>
               Archives the Ariadne thread and its workers and cancels active watches. Notes and the board stay readable here.
             </DialogDescription>
@@ -1116,6 +1127,7 @@ function WorkstreamDetail({ name }: { name: string }) {
       </Dialog>
       <DeleteWorkstreamDialog
         name={deleting ? name : null}
+        title={displayTitle}
         onClose={() => setDeleting(false)}
         onDeleted={() => navigate.toPluginPanel(PANEL_PATH)}
       />
@@ -1151,7 +1163,7 @@ function ThreadBoardPanel({ threadId }: PluginThreadPanelProps) {
   return (
     <div className="h-full overflow-y-auto p-3">
       <div className="mb-3 flex items-center gap-2">
-        <h3 className="flex-1 text-sm font-semibold">{data.workstream}</h3>
+        <h3 className="flex-1 text-sm font-semibold">{ws?.title ?? data.workstream}</h3>
         {(data.role === "worker" || data.role === "verifier") && ws !== null ? (
           <Button variant="outline" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>
             Open Ariadne
@@ -1185,7 +1197,7 @@ function HomeSection() {
             className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
             onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: ws.name })}
           >
-            {ws.name}
+            {ws.title}
           </button>
           <Counts ws={ws} />
           <Button variant="ghost" size="sm" onClick={() => navigate.toThread(ws.ariadneThreadId)}>

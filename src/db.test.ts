@@ -151,4 +151,20 @@ test("migrating an existing v0 database preserves existing workstreams, tasks, n
   const w = store.insertWatch({ workstream: "legacy", taskId: "t_leg1", kind: "pr-merged", target: "self", resumePrompt: "harvest", expiresAt: null });
   assert.equal(store.activeWatches("legacy").length, 1);
   assert.equal(store.watch(w.id)?.status, "active");
+  assert.equal(store.workstreamTitle(store.workstream("legacy")!), "legacy");
+});
+
+test("workstream display title defaults to name and updates cleanly", () => {
+  const { store } = memoryStore();
+  store.insertWorkstream("personal-workstream", "thr_a1", "proj", [], { title: "Slack Storage" });
+  const row = store.workstream("personal-workstream")!;
+  assert.equal(row.title, "Slack Storage");
+  assert.equal(store.workstreamTitle(row), "Slack Storage");
+
+  store.updateWorkstream("personal-workstream", { title: "Cross-DC Rollout" });
+  assert.equal(store.workstreamTitle(store.workstream("personal-workstream")!), "Cross-DC Rollout");
+
+  store.updateWorkstream("personal-workstream", { title: "   " });
+  assert.equal(store.workstream("personal-workstream")!.title, null);
+  assert.equal(store.workstreamTitle(store.workstream("personal-workstream")!), "personal-workstream");
 });

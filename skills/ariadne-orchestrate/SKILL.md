@@ -11,7 +11,9 @@ into an Ariadne thread or start orchestrating a workstream from this thread.
 ## Steps
 
 1. Pick a short, descriptive workstream name if the user did not specify one
-   (lowercase slug, e.g. `auth-refactor`).
+   (lowercase slug based on the conversation topic, e.g. `auth-refactor`). If
+   the thread has no topic yet, pass a short placeholder (such as `workstream`)
+   and rename it via `ariadne_session` once the user shares the goal.
 2. Run:
 
 ```bash

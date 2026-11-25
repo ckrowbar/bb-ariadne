@@ -25,6 +25,7 @@ function makeHarness(overrides?: {
   const contextTokensByThread = overrides?.contextTokensByThread ?? new Map<string, number>();
   const diffFilesByEnv = overrides?.diffFilesByEnv ?? new Map<string, { path: string; changeKind: "modified"; additions: number; deletions: number }[]>();
   const envs = new Map<string, Record<string, unknown>>();
+  const threadChangeListeners = new Set<(event: { entity: "thread"; id?: string; changes: string[] }) => void>();
 
   const { bb, harness } = createFakePluginHost({
     pluginId: "ariadne",
@@ -45,6 +46,13 @@ function makeHarness(overrides?: {
       ...(overrides?.settings ?? {}),
     },
     sdk: {
+      subscribe: ((args: { event: string; callback: (event: { entity: "thread"; id?: string; changes: string[] }) => void }) => {
+        if (args.event === "thread:changed") {
+          threadChangeListeners.add(args.callback);
+          return () => threadChangeListeners.delete(args.callback);
+        }
+        return () => {};
+      }) as never,
       projects: {
         get: async ({ projectId }: { projectId: string }) => ({
           id: projectId,
@@ -225,7 +233,14 @@ function makeHarness(overrides?: {
     },
   });
 
-  return { bb, harness, threads, prByEnv, contextTokensByThread, diffFilesByEnv };
+  const emitThreadChanged = async (id: string, changes: string[]) => {
+    for (const listener of threadChangeListeners) {
+      listener({ entity: "thread", id, changes });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  };
+
+  return { bb, harness, threads, prByEnv, contextTokensByThread, diffFilesByEnv, emitThreadChanged };
 }
 
 test("queued dependencies dispatch automatically when upstream completes and preserve sidebar nesting", async () => {
@@ -759,6 +774,101 @@ test("normal thread adopts into Ariadne via skill+CLI, reloads on idle, and thre
   assert.deepEqual(afterDetachCfg.tools, []);
   assert.deepEqual(afterDetachCfg.skills, ["ariadne-orchestrate"]);
 
+  await harness.lifecycle.dispose();
+});
+
+test("renaming Ariadne and worker threads preserves yarn/thread marks and syncs workstream and task titles", async () => {
+  const { bb, harness, threads, emitThreadChanged } = makeHarness();
+  await plugin(bb);
+  const service = harness.behavior.runService("reconciler");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  // Brand new normal thread with null title and fallback "become an ariadne thread".
+  const freshThread = makeThreadResponse({
+    id: "thr_fresh",
+    projectId: "proj_p",
+    environmentId: "env_fresh",
+    title: null,
+    titleFallback: "become an ariadne thread",
+    parentThreadId: null,
+    originPluginId: null,
+    status: "idle",
+    visibility: "visible",
+  });
+  threads.set(freshThread.id, freshThread);
+
+  // Adopting with an explicit name uses that name rather than titleFallback ("become an ariadne thread").
+  const adoptRes = await harness.behavior.runCli(["adopt", "personal-workstream"], {
+    threadId: freshThread.id,
+    projectId: "proj_p",
+  });
+  assert.equal(adoptRes.exitCode, 0);
+  assert.equal(threads.get(freshThread.id)?.title, "🧶 personal-workstream");
+
+  // Updating via ariadne_session updates BOTH the thread title and the workstream display title in overview.
+  await harness.behavior.callAgentTool(
+    "ariadne_session",
+    { action: "update", title: "slack-storage-cross-dc" },
+    { threadId: freshThread.id },
+  );
+  assert.equal(threads.get(freshThread.id)?.title, "🧶 slack-storage-cross-dc");
+  let overview = (await harness.behavior.callRpc("overview", null)) as {
+    workstreams: { name: string; title: string }[];
+  };
+  assert.equal(overview.workstreams.find((w) => w.name === "personal-workstream")?.title, "slack-storage-cross-dc");
+
+  // Renaming the Ariadne thread in BB without typing 🧶 preserves 🧶 and updates the Ariadne tab title.
+  threads.set(freshThread.id, { ...threads.get(freshThread.id)!, title: "Cross-DC storage rollout" });
+  await emitThreadChanged(freshThread.id, ["title-changed"]);
+  assert.equal(threads.get(freshThread.id)?.title, "🧶 Cross-DC storage rollout");
+  overview = (await harness.behavior.callRpc("overview", null)) as {
+    workstreams: { name: string; title: string }[];
+  };
+  assert.equal(overview.workstreams.find((w) => w.name === "personal-workstream")?.title, "Cross-DC storage rollout");
+
+  // Spawning a worker and renaming it in BB without typing 🧵 preserves 🧵 and updates the task title on the board.
+  await harness.behavior.callAgentTool(
+    "ariadne_spawn_worker",
+    { title: "Initial worker task", prompt: "Do work" },
+    { threadId: freshThread.id },
+  );
+  let board = (await harness.behavior.callRpc("board", { workstream: "personal-workstream" })) as {
+    tasks: { id: string; title: string; workerThreadId: string | null }[];
+  };
+  const workerId = board.tasks[0]!.workerThreadId!;
+  assert.equal(threads.get(workerId)?.title, "🧵 Initial worker task");
+
+  threads.set(workerId, { ...threads.get(workerId)!, title: "Fix webhook retry" });
+  await emitThreadChanged(workerId, ["title-changed"]);
+  assert.equal(threads.get(workerId)?.title, "🧵 Fix webhook retry");
+  board = (await harness.behavior.callRpc("board", { workstream: "personal-workstream" })) as {
+    tasks: { id: string; title: string; workerThreadId: string | null }[];
+  };
+  assert.equal(board.tasks[0]!.title, "Fix webhook retry");
+
+  // Reconciler also self-heals any pre-existing title drift without waiting for a realtime event.
+  threads.set(freshThread.id, { ...threads.get(freshThread.id)!, title: "Renamed while offline" });
+  threads.set(workerId, { ...threads.get(workerId)!, title: "Worker renamed while offline" });
+  await harness.behavior.runCli(["reconcile"]);
+  assert.equal(threads.get(freshThread.id)?.title, "🧶 Renamed while offline");
+  assert.equal(threads.get(workerId)?.title, "🧵 Worker renamed while offline");
+  overview = (await harness.behavior.callRpc("overview", null)) as {
+    workstreams: { name: string; title: string }[];
+  };
+  assert.equal(overview.workstreams.find((w) => w.name === "personal-workstream")?.title, "Renamed while offline");
+  board = (await harness.behavior.callRpc("board", { workstream: "personal-workstream" })) as {
+    tasks: { id: string; title: string; workerThreadId: string | null }[];
+  };
+  assert.equal(board.tasks[0]!.title, "Worker renamed while offline");
+
+  // Detaching strips 🧶 and a subsequent title-changed event does NOT put 🧶 back.
+  await harness.behavior.callAgentTool("ariadne_session", { action: "detach" }, { threadId: freshThread.id });
+  assert.equal(threads.get(freshThread.id)?.title, "Renamed while offline");
+  await emitThreadChanged(freshThread.id, ["title-changed"]);
+  assert.equal(threads.get(freshThread.id)?.title, "Renamed while offline");
+
+  service.controller.abort();
+  await service.done;
   await harness.lifecycle.dispose();
 });
 

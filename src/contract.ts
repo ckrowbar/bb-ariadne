@@ -140,6 +140,7 @@ export type BoardTask = z.infer<typeof boardTaskSchema>;
 
 const workstreamSchema = z.object({
   name: z.string(),
+  title: z.string(),
   ariadneThreadId: z.string(),
   projectId: z.string(),
   projectName: z.string().nullable(),
