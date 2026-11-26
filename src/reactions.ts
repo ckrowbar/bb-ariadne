@@ -104,7 +104,24 @@ export function decidePrReaction(
     };
   }
 
+  if (pr.attention === "draft" && pr.checks.state === "passing" && pr.checks.passed > 0) {
+    return {
+      kind: "escalate",
+      reason: `Draft PR #${pr.number} checks are passing (${pr.checks.passed} passed, ${pr.url}). Check with the user whether to mark it ready for review.`,
+      signature: `draft_green:${pr.number}`,
+    };
+  }
+
   return { kind: "none" };
+}
+
+const TRANSIENT_ERROR_RE =
+  /\b(429|500|502|503|504|529)\b|temporar|overloaded|rate.?limit|timeout|timed out|econnreset|econnrefused|socket hang up|network|try again|unavailable|gateway/i;
+
+/** Whether a failed provider turn looks transient enough for a bounded automatic retry. */
+export function isTransientProviderError(error: string | null | undefined): boolean {
+  if (!error) return false;
+  return TRANSIENT_ERROR_RE.test(error);
 }
 
 /** Whether a worker thread should rotate to a fresh run on the same worktree before taking a new phase. */

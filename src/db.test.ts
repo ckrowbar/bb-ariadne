@@ -168,3 +168,49 @@ test("workstream display title defaults to name and updates cleanly", () => {
   assert.equal(store.workstream("personal-workstream")!.title, null);
   assert.equal(store.workstreamTitle(store.workstream("personal-workstream")!), "personal-workstream");
 });
+
+test("watches support owner and null taskId for workstream-level manager watches", () => {
+  const { store } = memoryStore();
+  store.insertWorkstream("ws", "thr_a1", "proj", []);
+  const task = store.insertTask({ workstream: "ws", title: "t", links: [], workerThreadId: "thr_w1", environmentId: null });
+
+  const workerWatch = store.insertWatch({
+    workstream: "ws",
+    taskId: task.id,
+    kind: "timer",
+    target: "10m",
+    resumePrompt: "worker check",
+    expiresAt: null,
+  });
+  assert.equal(workerWatch.owner, "worker");
+  assert.equal(workerWatch.taskId, task.id);
+
+  const mgrTaskWatch = store.insertWatch({
+    workstream: "ws",
+    taskId: task.id,
+    owner: "ariadne",
+    kind: "pr-checks",
+    target: "ddoghq/dd-source#189159",
+    resumePrompt: "mark ready",
+    expiresAt: null,
+  });
+  assert.equal(mgrTaskWatch.owner, "ariadne");
+
+  const wsWatch = store.insertWatch({
+    workstream: "ws",
+    taskId: null,
+    owner: "ariadne",
+    kind: "timer",
+    target: "5m",
+    resumePrompt: "follow up",
+    expiresAt: null,
+  });
+  assert.equal(wsWatch.owner, "ariadne");
+  assert.equal(wsWatch.taskId, null);
+
+  // Cancelling worker-owned watches leaves manager-owned watches untouched.
+  assert.equal(store.cancelWatchesForTask(task.id, "worker"), 1);
+  assert.equal(store.watch(workerWatch.id)?.status, "cancelled");
+  assert.equal(store.watch(mgrTaskWatch.id)?.status, "active");
+  assert.equal(store.watch(wsWatch.id)?.status, "active");
+});

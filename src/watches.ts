@@ -23,7 +23,7 @@ export interface WatchEvalContext {
   getTask(taskId: string): Task | undefined;
   getTaskPr(task: Task): Promise<PrSummary | null>;
   fetchExternalPr(ref: GitHubPrRef): Promise<ExternalPrState>;
-  runCommand(task: Task, command: string): Promise<{ ok: boolean; output: string }>;
+  runCommand(task: Task | null, command: string): Promise<{ ok: boolean; output: string }>;
 }
 
 export type WatchEvalOutcome =
@@ -71,7 +71,7 @@ export function parseTimerTarget(target: string, now = Date.now()): number | nul
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-export async function evaluateWatch(watch: Watch, task: Task, ctx: WatchEvalContext): Promise<WatchEvalOutcome> {
+export async function evaluateWatch(watch: Watch, task: Task | null, ctx: WatchEvalContext): Promise<WatchEvalOutcome> {
   if (watch.expiresAt !== null && ctx.now >= watch.expiresAt) {
     return {
       status: "expired",
@@ -133,6 +133,9 @@ export async function evaluateWatch(watch: Watch, task: Task, ctx: WatchEvalCont
       let url = watch.target;
 
       if (watch.target === "self") {
+        if (task === null) {
+          return { status: "expired", state: "no-task", detail: "Watch target 'self' requires an associated task." };
+        }
         const pr = await ctx.getTaskPr(task);
         if (pr === null) return { status: "pending", state: "no-pr" };
         state = pr.state === "merged" ? "merged" : pr.state === "closed" ? "closed" : "open";

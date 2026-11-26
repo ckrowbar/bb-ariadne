@@ -188,9 +188,33 @@ function BoardTable({ workstream, compact = false }: { workstream: string; compa
   if (data === null) return error === null ? <EmptyState>Loading board…</EmptyState> : <ErrorLine error={error} />;
   const visible = data.tasks.filter((t) => showClosed || (t.status !== "done" && t.status !== "dropped"));
   const closedCount = data.tasks.length - data.tasks.filter((t) => t.status !== "done" && t.status !== "dropped").length;
+  const workstreamWatches = data.watches ?? [];
 
   return (
     <div>
+      {workstreamWatches.length > 0 ? (
+        <div className="mb-3 rounded-lg border border-border bg-card px-3 py-2 text-xs">
+          <p className="font-medium text-foreground">Active workstream watches</p>
+          <ul className="mt-1 space-y-1">
+            {workstreamWatches.map((w) => (
+              <li key={w.id} className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                <span className="font-mono">{w.kind}</span>
+                <span className="break-all">{w.target}</span>
+                {w.lastState ? <span>({w.lastState})</span> : null}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="ml-auto h-6 px-2 text-xs"
+                  disabled={busyAction !== null}
+                  onClick={() => void runAction(`watch:${w.id}`, () => rpc.call("watch_cancel", { watchId: w.id }))}
+                >
+                  Cancel
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       {visible.length === 0 ? (
         <EmptyState>No open tasks. Hand Ariadne a ticket in its thread.</EmptyState>
       ) : (

@@ -11,6 +11,7 @@ import type {
   TaskStatus,
   VerifyMode,
   WatchKind,
+  WatchOwner,
   WatchStatus,
 } from "./constants.ts";
 import type { Note, PrSummary, StagingEntry, Task, TaskRun, Watch } from "./contract.ts";
@@ -77,6 +78,7 @@ interface WatchRow {
   id: string;
   workstream: string;
   task_id: string;
+  owner: WatchOwner;
   kind: WatchKind;
   target: string;
   resume_prompt: string;
@@ -221,6 +223,7 @@ const MIGRATIONS = [
      flagged_streak TEXT,
      updated_at INTEGER NOT NULL)`,
   `ALTER TABLE workstreams ADD COLUMN title TEXT`,
+  `ALTER TABLE watches ADD COLUMN owner TEXT NOT NULL DEFAULT 'worker'`,
 ];
 
 function parseStringArray(json: string | null | undefined): string[] {
@@ -298,7 +301,8 @@ function toWatch(row: WatchRow): Watch {
   return {
     id: row.id,
     workstream: row.workstream,
-    taskId: row.task_id,
+    taskId: row.task_id === "" ? null : row.task_id,
+    owner: row.owner === "ariadne" ? "ariadne" : "worker",
     kind: row.kind,
     target: row.target,
     resumePrompt: row.resume_prompt,
@@ -434,6 +438,7 @@ export function openStore(bb: BbPluginApi) {
           delDigest.run(`pr:${id}`, `stuck:${id}`, `harvest:${id}`, `react:${id}`, `dep-drop:${id}`);
           if (worker_thread_id !== null) delTurn.run(worker_thread_id);
         }
+        db.prepare("DELETE FROM digest_state WHERE key IN (?, ?, ?)").run(`compact:${name}`, `inflight:${name}`, `mgr-reply:${name}`);
         for (const { thread_id } of runThreads) delTurn.run(thread_id);
         for (const table of ["task_runs", "watches", "tasks", "notes", "note_revisions", "events"]) {
           db.prepare(`DELETE FROM ${table} WHERE workstream = ?`).run(name);
@@ -687,7 +692,8 @@ export function openStore(bb: BbPluginApi) {
     // Watches (durable zero-token polling)
     insertWatch(input: {
       workstream: string;
-      taskId: string;
+      taskId: string | null;
+      owner?: WatchOwner;
       kind: WatchKind;
       target: string;
       resumePrompt: string;
@@ -695,10 +701,11 @@ export function openStore(bb: BbPluginApi) {
     }): Watch {
       const id = `w_${randomUUID().slice(0, 8)}`;
       const now = Date.now();
+      const owner: WatchOwner = input.owner === "ariadne" ? "ariadne" : "worker";
       db.prepare(
-        `INSERT INTO watches (id, workstream, task_id, kind, target, resume_prompt, status, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-      ).run(id, input.workstream, input.taskId, input.kind, input.target, input.resumePrompt, input.expiresAt, now);
+        `INSERT INTO watches (id, workstream, task_id, owner, kind, target, resume_prompt, status, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+      ).run(id, input.workstream, input.taskId ?? "", owner, input.kind, input.target, input.resumePrompt, input.expiresAt, now);
       return this.watch(id)!;
     },
     watch(id: string): Watch | undefined {
@@ -742,10 +749,13 @@ export function openStore(bb: BbPluginApi) {
       }
       return this.watch(id);
     },
-    cancelWatchesForTask(taskId: string): number {
-      const res = db
-        .prepare("UPDATE watches SET status = 'cancelled' WHERE task_id = ? AND status = 'active'")
-        .run(taskId);
+    cancelWatchesForTask(taskId: string, owner?: WatchOwner): number {
+      const res =
+        owner === undefined
+          ? db.prepare("UPDATE watches SET status = 'cancelled' WHERE task_id = ? AND status = 'active'").run(taskId)
+          : db
+              .prepare("UPDATE watches SET status = 'cancelled' WHERE task_id = ? AND owner = ? AND status = 'active'")
+              .run(taskId, owner);
       return Number(res.changes);
     },
     cancelWatchesForWorkstream(workstream: string): number {
@@ -866,6 +876,12 @@ export function openStore(bb: BbPluginApi) {
          ON CONFLICT (key) DO UPDATE SET signature = excluded.signature, updated_at = excluded.updated_at`,
       ).run(key, signature, Date.now());
       return true;
+    },
+    digestValue(key: string): string | null {
+      const current = db.prepare("SELECT signature FROM digest_state WHERE key = ?").get(key) as
+        | { signature: string }
+        | undefined;
+      return current?.signature ?? null;
     },
     clearDigest(key: string) {
       db.prepare("DELETE FROM digest_state WHERE key = ?").run(key);

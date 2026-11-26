@@ -12,6 +12,10 @@ import plugin from "../server.ts";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+function isToolError(result: unknown): boolean {
+  return typeof result === "object" && result !== null && "isError" in result && Boolean((result as { isError?: boolean }).isError);
+}
+
 function makeHarness(overrides?: {
   settings?: Record<string, unknown>;
   prByEnv?: Map<string, Record<string, unknown>>;
@@ -180,6 +184,12 @@ function makeHarness(overrides?: {
         archive: async ({ threadId }: { threadId: string }) => {
           const t = threads.get(threadId);
           if (t) threads.set(threadId, { ...t, archivedAt: Date.now() });
+          return { ok: true };
+        },
+        delete: async ({ threadId }: { threadId: string }) => {
+          const t = threads.get(threadId);
+          if (!t) throw new Error(`404 thread ${threadId} not found`);
+          threads.set(threadId, { ...t, deletedAt: Date.now() });
           return { ok: true };
         },
         stop: async () => ({ ok: true }),
@@ -869,6 +879,347 @@ test("renaming Ariadne and worker threads preserves yarn/thread marks and syncs 
 
   service.controller.abort();
   await service.done;
+  await harness.lifecycle.dispose();
+});
+
+test("manager-owned watches survive done tasks, wake Ariadne, and workstream-level watches appear on the board", async () => {
+  const { bb, harness, threads } = makeHarness();
+  await plugin(bb);
+
+  const ws = (await harness.behavior.callRpc("workstream_create", {
+    name: "watch-ws",
+    projectId: "proj_p",
+    links: [],
+  })) as { ariadneThreadId: string };
+
+  await harness.behavior.callAgentTool(
+    "ariadne_spawn_worker",
+    { title: "Fix PR", prompt: "Fix it", verifyMode: "off" },
+    { threadId: ws.ariadneThreadId },
+  );
+  let board = (await harness.behavior.callRpc("board", { workstream: "watch-ws" })) as {
+    tasks: { id: string; status: string; workerThreadId: string }[];
+    watches: { id: string; owner: string; taskId: string | null }[];
+  };
+  const taskId = board.tasks[0]!.id;
+  const workerId = board.tasks[0]!.workerThreadId;
+
+  // Worker reports done -> task becomes "done".
+  await harness.behavior.callAgentTool("ariadne_report", { status: "done", note: "Pushed fix" }, { threadId: workerId });
+
+  // Ariadne registers a watch on the ALREADY-DONE task (the exact thr_3pp3mkjk95 scenario!)
+  // AND a workstream-level watch with no taskId.
+  const pastTarget = String(Date.now() - 1000);
+  const resTaskWatch = await harness.behavior.callAgentTool(
+    "ariadne_watch",
+    { kind: "timer", target: pastTarget, taskId, resumePrompt: "Mark #189159 ready for review" },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(resTaskWatch), false);
+  assert.match(JSON.stringify(resTaskWatch), /wakes ariadne/);
+
+  const resWsWatch = await harness.behavior.callAgentTool(
+    "ariadne_watch",
+    { kind: "timer", target: "2h", resumePrompt: "Follow up on reviews" },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(resWsWatch), false);
+
+  // Worker-targeted watch on a done task is explicitly rejected instead of silently cancelled later.
+  const resBadWorkerWatch = await harness.behavior.callAgentTool(
+    "ariadne_watch",
+    { kind: "timer", target: "1h", taskId, wake: "worker", resumePrompt: "nope" },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(resBadWorkerWatch), true);
+
+  // Workstream-level watch appears in both board RPC and ariadne_board output.
+  board = (await harness.behavior.callRpc("board", { workstream: "watch-ws" })) as {
+    tasks: { id: string; status: string; workerThreadId: string }[];
+    watches: { id: string; owner: string; taskId: string | null }[];
+  };
+  assert.equal(board.watches.length, 1);
+  assert.equal(board.watches[0]!.owner, "ariadne");
+  assert.equal(board.watches[0]!.taskId, null);
+
+  // Reconcile triggers the due watch on the done task and wakes ARIADNE (not the old worker!).
+  const sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+  await harness.behavior.runCli(["reconcile"]);
+  const newSends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore);
+  assert.ok(
+    newSends.some((c) => {
+      const arg = c[0] as { threadId: string; input: { text: string }[] };
+      return arg.threadId === ws.ariadneThreadId && arg.input[0]?.text.includes("Mark #189159 ready for review");
+    }),
+    "due manager watch on done task must fire and wake Ariadne",
+  );
+  assert.ok(
+    !newSends.some((c) => (c[0] as { threadId: string }).threadId === workerId),
+    "manager-owned watch must NOT wake the old worker thread",
+  );
+
+  // Keep lint happy on threads reference
+  assert.ok(threads.has(ws.ariadneThreadId));
+  await harness.lifecycle.dispose();
+});
+
+test("settled handoff fires only when Ariadne went silent, draft PR green notifies once, and transient manager failures retry cleanly", async () => {
+  const prByEnv = new Map<string, Record<string, unknown>>();
+  const { bb, harness, threads } = makeHarness({ prByEnv });
+  await plugin(bb);
+
+  const ws = (await harness.behavior.callRpc("workstream_create", {
+    name: "handoff-ws",
+    projectId: "proj_p",
+    links: [],
+  })) as { ariadneThreadId: string };
+
+  await harness.behavior.callAgentTool(
+    "ariadne_spawn_worker",
+    { title: "Build feature", prompt: "Implement", verifyMode: "off" },
+    { threadId: ws.ariadneThreadId },
+  );
+  const board = (await harness.behavior.callRpc("board", { workstream: "handoff-ws" })) as {
+    tasks: { id: string; workerThreadId: string; environmentId: string }[];
+  };
+  const task = board.tasks[0]!;
+
+  // Worker opens a draft PR with pending checks -> quiet.
+  prByEnv.set(task.environmentId, {
+    number: 189159,
+    title: "Live GS read",
+    url: "https://github.com/ddoghq/dd-source/pull/189159",
+    state: "open",
+    attention: "draft",
+    checks: { state: "pending", passedCount: 1, failedCount: 0, pendingCount: 2 },
+    updatedAt: "2026-11-26T05:00:00Z",
+    review: { state: "none" },
+    mergeability: { state: "mergeable" },
+  });
+  await harness.behavior.callAgentTool(
+    "ariadne_report",
+    { status: "done", note: "Opened draft PR", prUrl: "https://github.com/ddoghq/dd-source/pull/189159" },
+    { threadId: task.workerThreadId },
+  );
+
+  // Simulate Ariadne finishing its turn silently (no visible text) after task moved to in-review.
+  await harness.behavior.emitThreadEvent("thread.idle", {
+    thread: { ...threads.get(ws.ariadneThreadId)!, status: "idle" },
+    lastAssistantText: "",
+  });
+
+  // First reconcile observes 0 active tasks/watches and enters the 5s settling grace window.
+  const realNow = Date.now;
+  let clockOffset = 0;
+  Date.now = () => realNow() + clockOffset;
+  try {
+    let sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    assert.equal(harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).length, 0, "waits out 5s settling grace");
+
+    // Advance clock past SETTLED_GRACE_MS (5s) and reconcile -> settled handoff fires once!
+    clockOffset += 10_000;
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    let newSends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore);
+    assert.ok(
+      newSends.some((c) => {
+        const arg = c[0] as { threadId: string; input: { text: string }[] };
+        return arg.threadId === ws.ariadneThreadId && arg.input[0]?.text.includes("Workstream settled");
+      }),
+      "settled handoff wakes Ariadne when it ended silently",
+    );
+
+    // Second reconcile stays quiet (deduped).
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    newSends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore);
+    assert.equal(newSends.length, 0, "settled handoff must not repeat");
+
+    // Verify anti-spam: when another wave finishes AND Ariadne posts a visible reply, no settled wake fires.
+    await harness.behavior.callAgentTool(
+      "ariadne_spawn_worker",
+      { title: "Second task", prompt: "Do second thing", verifyMode: "off" },
+      { threadId: ws.ariadneThreadId },
+    );
+    const board2 = (await harness.behavior.callRpc("board", { workstream: "handoff-ws" })) as {
+      tasks: { id: string; title: string; workerThreadId: string }[];
+    };
+    const secondTask = board2.tasks.find((t) => t.title === "Second task")!;
+    await harness.behavior.callAgentTool(
+      "ariadne_report",
+      { status: "done", note: "Second task complete" },
+      { threadId: secondTask.workerThreadId },
+    );
+    // Mark harvested so harvest digest does not fire, and simulate visible reply from Ariadne after settling starts.
+    await harness.behavior.callAgentTool(
+      "ariadne_task_update",
+      { taskId: secondTask.id, harvested: true },
+      { threadId: ws.ariadneThreadId },
+    );
+    await harness.behavior.runCli(["reconcile"]);
+    clockOffset += 1_000;
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: { ...threads.get(ws.ariadneThreadId)!, status: "idle" },
+      lastAssistantText: "Second task is done; here is the wrap-up.",
+    });
+    clockOffset += 10_000;
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    assert.equal(
+      harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).length,
+      0,
+      "no settled wake when Ariadne already sent a visible reply",
+    );
+
+    // Draft PR checks flip green -> notifies Ariadne once!
+    prByEnv.set(task.environmentId, {
+      number: 189159,
+      title: "Live GS read",
+      url: "https://github.com/ddoghq/dd-source/pull/189159",
+      state: "open",
+      attention: "draft",
+      checks: { state: "passing", passedCount: 5, failedCount: 0, pendingCount: 0 },
+      updatedAt: "2026-11-26T05:05:00Z",
+      review: { state: "none" },
+      mergeability: { state: "mergeable" },
+    });
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    newSends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore);
+    assert.ok(
+      newSends.some((c) => {
+        const arg = c[0] as { threadId: string; input: { text: string }[] };
+        return arg.threadId === ws.ariadneThreadId && arg.input[0]?.text.includes("Draft PR #189159 checks are passing");
+      }),
+      "draft PR green notifies Ariadne once",
+    );
+
+    // Next tick while still green -> quiet.
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    assert.equal(harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).length, 0);
+
+    // Manager hits a transient 503 failure -> schedules retry after 30s, wakes Ariadne, then clears on idle.
+    threads.set(ws.ariadneThreadId, { ...threads.get(ws.ariadneThreadId)!, status: "error" });
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: threads.get(ws.ariadneThreadId)!,
+      error: "API Error: 503 AI Gateway requires a foreground login. This is temporary.",
+    });
+
+    // Before 30s backoff elapses: no retry yet.
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    assert.equal(harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).length, 0);
+
+    // After 31s backoff: retry fires once!
+    clockOffset += 31_000;
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    newSends = harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore);
+    assert.ok(
+      newSends.some((c) => {
+        const arg = c[0] as { threadId: string; input: { text: string }[] };
+        return arg.threadId === ws.ariadneThreadId && arg.input[0]?.text.includes("Automatic recovery after a transient turn failure");
+      }),
+      "transient manager failure triggers automatic recovery retry",
+    );
+
+    // Non-transient failure does NOT schedule retry.
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: { ...threads.get(ws.ariadneThreadId)!, status: "idle" },
+      lastAssistantText: "Recovered and ready.",
+    });
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: threads.get(ws.ariadneThreadId)!,
+      error: "Invalid parameter: unknown model",
+    });
+    clockOffset += 120_000;
+    sendsBefore = harness.inspection.sdk.callsTo("threads.send").length;
+    await harness.behavior.runCli(["reconcile"]);
+    assert.equal(harness.inspection.sdk.callsTo("threads.send").slice(sendsBefore).length, 0);
+  } finally {
+    Date.now = realNow;
+  }
+
+  await harness.lifecycle.dispose();
+});
+
+test("ariadne_delete_thread deletes completed/unneeded threads in this workstream safely and keeps board history", async () => {
+  const { bb, harness, threads } = makeHarness();
+  await plugin(bb);
+
+  const ws = (await harness.behavior.callRpc("workstream_create", {
+    name: "cleanup-ws",
+    projectId: "proj_p",
+    links: [],
+  })) as { ariadneThreadId: string };
+
+  // Unrelated thread outside this workstream.
+  const outsider = makeThreadResponse({
+    id: "thr_outsider",
+    projectId: "proj_p",
+    environmentId: "env_out",
+    title: "Personal chat",
+    parentThreadId: null,
+    originPluginId: null,
+    status: "idle",
+  });
+  threads.set(outsider.id, outsider);
+
+  await harness.behavior.callAgentTool(
+    "ariadne_spawn_worker",
+    { title: "One-off review", prompt: "Review PRs", verifyMode: "off" },
+    { threadId: ws.ariadneThreadId },
+  );
+  let board = (await harness.behavior.callRpc("board", { workstream: "cleanup-ws" })) as {
+    tasks: { id: string; status: string; workerThreadId: string | null }[];
+  };
+  const taskId = board.tasks[0]!.id;
+  const workerId = board.tasks[0]!.workerThreadId!;
+
+  // Refuses deleting the manager thread itself.
+  const delSelf = await harness.behavior.callAgentTool(
+    "ariadne_delete_thread",
+    { threadId: ws.ariadneThreadId },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(delSelf), true);
+
+  // Refuses deleting unrelated threads outside this workstream.
+  const delOutsider = await harness.behavior.callAgentTool(
+    "ariadne_delete_thread",
+    { threadId: outsider.id },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(delOutsider), true);
+  assert.equal(threads.get(outsider.id)?.deletedAt, null);
+
+  // Refuses deleting a still-running worker task unless force=true.
+  const delRunning = await harness.behavior.callAgentTool(
+    "ariadne_delete_thread",
+    { taskId },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(delRunning), true);
+  assert.equal(threads.get(workerId)?.deletedAt, null);
+
+  // Once worker finishes (done), Ariadne can delete its thread while keeping the completed task on the board.
+  await harness.behavior.callAgentTool("ariadne_report", { status: "done", note: "Review complete" }, { threadId: workerId });
+  const delDone = await harness.behavior.callAgentTool(
+    "ariadne_delete_thread",
+    { taskId, reason: "Review harvested" },
+    { threadId: ws.ariadneThreadId },
+  );
+  assert.equal(isToolError(delDone), false);
+  assert.notEqual(threads.get(workerId)?.deletedAt, null, "completed worker thread was deleted");
+
+  board = (await harness.behavior.callRpc("board", { workstream: "cleanup-ws" })) as {
+    tasks: { id: string; status: string; workerThreadId: string | null }[];
+  };
+  assert.equal(board.tasks[0]!.status, "done", "task stays done on the board instead of dropped");
+  assert.equal(board.tasks[0]!.workerThreadId, null);
+
   await harness.lifecycle.dispose();
 });
 

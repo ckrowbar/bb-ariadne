@@ -62,6 +62,7 @@ test("rows surface dependencies, watches, context tokens and multiple runs", () 
           id: "w_1",
           workstream: "ariadne-e2e",
           taskId: task.id,
+          owner: "worker",
           kind: "pr-merged",
           target: "ddoghq/k8s#18506",
           resumePrompt: "continue",

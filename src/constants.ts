@@ -56,6 +56,9 @@ export type WatchKind = (typeof WATCH_KINDS)[number];
 export const WATCH_STATUSES = ["active", "triggered", "cancelled", "expired"] as const;
 export type WatchStatus = (typeof WATCH_STATUSES)[number];
 
+export const WATCH_OWNERS = ["worker", "ariadne"] as const;
+export type WatchOwner = (typeof WATCH_OWNERS)[number];
+
 export const REASONING_LEVELS = ["none", "low", "medium", "high", "xhigh", "max", "ultra", "ultracode"] as const;
 export type ReasoningLevel = (typeof REASONING_LEVELS)[number];
 

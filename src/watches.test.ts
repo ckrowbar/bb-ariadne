@@ -39,6 +39,7 @@ function makeWatch(overrides: Partial<Watch>): Watch {
     id: "w_1",
     workstream: "ws",
     taskId: "t_1",
+    owner: "worker",
     kind: "timer",
     target: "10m",
     resumePrompt: "continue",

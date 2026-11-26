@@ -16,6 +16,7 @@ import {
   TASK_STATUSES,
   VERIFY_MODES,
   WATCH_KINDS,
+  WATCH_OWNERS,
   rpcContract,
   type AgentDefaults,
   type BoardTask,
@@ -28,6 +29,7 @@ import {
   type VerifyMode,
   type Watch,
   type WatchKind,
+  type WatchOwner,
   type Workstream,
 } from "./src/contract.ts";
 import { openStore, type WorkstreamRow } from "./src/db.ts";
@@ -53,7 +55,13 @@ import {
 } from "./src/git.ts";
 import { ariadneInstructions, MEMORY_INSTRUCTIONS, verifierInstructions, workerInstructions } from "./src/instructions.ts";
 import { WorkerTurns } from "./src/notifications.ts";
-import { decidePrReaction, shouldCompactManager, shouldRotateWorker, shouldRunVerifier } from "./src/reactions.ts";
+import {
+  decidePrReaction,
+  isTransientProviderError,
+  shouldCompactManager,
+  shouldRotateWorker,
+  shouldRunVerifier,
+} from "./src/reactions.ts";
 import { computeTaskAttention, findDependencyCycle, isDependencySatisfied, planQueuedDispatch } from "./src/scheduler.ts";
 import { evaluateWatch, parsePrTarget, parseTimerTarget } from "./src/watches.ts";
 
@@ -291,6 +299,16 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const pendingSessionActions = new Map<string, PendingSessionAction>();
   const syncingThreads = new Set<string>();
+
+  const MAX_MANAGER_RETRIES = 2;
+  const SETTLED_GRACE_MS = 5_000;
+  type PendingManagerRetry = {
+    workstream: string;
+    attempt: number;
+    retryAt: number;
+    error: string;
+  };
+  const pendingManagerRetries = new Map<string, PendingManagerRetry>();
 
   function isManagedThread(threadId: string): boolean {
     return (
@@ -1039,6 +1057,7 @@ export default async function plugin(bb: BbPluginApi) {
       dependsMode,
       verifyMode,
     });
+    store.digestChanged(`inflight:${ws.name}`, "busy");
 
     const byId = new Map(wsTasks.map((t) => [t.id, t]));
     const depsReady = deps.every((id) => isDependencySatisfied(byId.get(id), dependsMode));
@@ -1406,6 +1425,123 @@ Verify each finding against the original task contract, fix real bugs, re-run te
     return `Dropped ${task.title}.`;
   }
 
+  /**
+   * Deletes a completed or unneeded worker/child thread belonging to this workstream.
+   * Keeps completed/in-review task history on the board instead of marking it dropped.
+   */
+  async function deleteManagedThread(
+    ws: WorkstreamRow,
+    args: { threadId?: string; taskId?: string; reason?: string; force?: boolean },
+  ): Promise<string> {
+    let task: Task | undefined;
+    if (args.taskId !== undefined) {
+      task = store.task(args.taskId);
+      if (task === undefined || task.workstream !== ws.name) {
+        throw new Error(`No task ${args.taskId} in workstream "${ws.name}".`);
+      }
+    }
+    const targetThreadId = args.threadId?.trim() || task?.workerThreadId || null;
+    if (targetThreadId === null) {
+      if (task !== undefined) return `Task ${task.id} (${task.title}) already has no worker thread.`;
+      throw new Error("Pass threadId or taskId to delete.");
+    }
+    if (targetThreadId === ws.ariadne_thread_id) {
+      throw new Error("Cannot delete the Ariadne manager thread itself; use ariadne_session detach or delete the workstream.");
+    }
+
+    if (task === undefined) {
+      const activeByWorker = store.activeTaskByWorker(targetThreadId);
+      if (activeByWorker !== undefined && activeByWorker.workstream === ws.name) {
+        task = activeByWorker;
+      }
+    }
+    const run = store.runByThread(targetThreadId);
+    const targetThread = await bb.sdk.threads.get({ threadId: targetThreadId }).catch(() => null);
+    const belongsToWorkstream =
+      (task !== undefined && task.workstream === ws.name) ||
+      (run !== undefined && run.workstream === ws.name) ||
+      targetThread?.parentThreadId === ws.ariadne_thread_id;
+    if (!belongsToWorkstream) {
+      throw new Error(`Refused: thread ${targetThreadId} does not belong to workstream "${ws.name}".`);
+    }
+
+    const isTaskCurrentWorker = task !== undefined && task.workerThreadId === targetThreadId;
+    if (!args.force) {
+      if (targetThread !== null && (targetThread.status === "active" || targetThread.status === "starting")) {
+        throw new Error(
+          `Refused to delete @thread:${targetThreadId} because it is still running (${targetThread.status}). Stop it first or pass force=true.`,
+        );
+      }
+      if (
+        isTaskCurrentWorker &&
+        task !== undefined &&
+        (task.status === "running" || task.status === "verifying" || task.status === "waiting")
+      ) {
+        throw new Error(
+          `Refused to delete @thread:${targetThreadId} while task ${task.id} is still ${task.status}. Update the task to done/in-review first, use ariadne_drop_task to abandon it, or pass force=true.`,
+        );
+      }
+      if (isTaskCurrentWorker && task !== undefined) {
+        const risk = await workAtRisk(task).catch(() => null);
+        if (risk !== null) {
+          throw new Error(
+            `Refused to delete @thread:${targetThreadId} (${task.id}) because work is at risk: ${risk}. Confirm with the user and pass force=true if you want to discard it.`,
+          );
+        }
+      }
+    }
+
+    if (isTaskCurrentWorker && task !== undefined) {
+      await retireWorkerEnvironment(task, false).catch((err: unknown) => {
+        bb.log.warn(`retire env before deleting ${targetThreadId}: ${String(err)}`);
+      });
+      store.cancelWatchesForTask(task.id, "worker");
+      const nextStatus =
+        task.status === "running" || task.status === "verifying" || task.status === "waiting" ? "dropped" : task.status;
+      task = store.updateTask(task.id, { workerThreadId: null, status: nextStatus }) ?? task;
+    }
+
+    if (run !== undefined && run.status === "running") {
+      store.updateRunByThread(targetThreadId, {
+        status: "completed",
+        summary: args.reason?.trim() || "Thread deleted by Ariadne",
+        endedAt: Date.now(),
+      });
+    }
+    workerTurns.clear(targetThreadId);
+    pendingSessionActions.delete(targetThreadId);
+
+    let outcome = "deleted";
+    syncingThreads.add(targetThreadId);
+    try {
+      await bb.sdk.threads.delete({ threadId: targetThreadId, childThreadsConfirmed: true });
+    } catch (error) {
+      if (isNotFound(error)) {
+        outcome = "already gone";
+      } else {
+        bb.log.warn(`delete managed thread ${targetThreadId} failed, archiving: ${String(error)}`);
+        await bb.sdk.threads.archive({ threadId: targetThreadId }).catch((archiveError: unknown) => {
+          if (!isNotFound(archiveError)) throw archiveError;
+        });
+        outcome = "archived (delete failed)";
+      }
+    } finally {
+      syncingThreads.delete(targetThreadId);
+    }
+
+    store.event(
+      "thread-deleted",
+      `${targetThreadId} (${outcome})${args.reason ? `: ${args.reason}` : ""}`,
+      ws.name,
+      task?.id ?? null,
+    );
+    publish();
+    kickReconciler();
+    return task !== undefined
+      ? `Deleted thread ${targetThreadId} (${outcome}); kept task ${task.id} (${task.status}) on the board.`
+      : `Deleted thread ${targetThreadId} (${outcome}).`;
+  }
+
   async function retireWorkerEnvironment(task: Task, notify = true) {
     const environmentId = await environmentIdFor(task);
     if (environmentId === null) return;
@@ -1612,10 +1748,10 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         }
       },
       fetchExternalPr: fetchGitHubPr,
-      runCommand: async (task: Task, command: string) => {
-        const environmentId = await environmentIdFor(task);
+      runCommand: async (task: Task | null, command: string) => {
+        const environmentId = task !== null ? await environmentIdFor(task) : null;
         const env = environmentId ? await bb.sdk.environments.get({ environmentId }).catch(() => null) : null;
-        const ws = store.workstream(task.workstream);
+        const ws = task !== null ? store.workstream(task.workstream) : undefined;
         const fallbackPath = ws ? (await projectSource(ws.project_id).catch(() => null))?.path ?? process.cwd() : process.cwd();
         const cwd = env?.path ?? fallbackPath;
         return runCheckCommand(cwd, command);
@@ -1623,27 +1759,73 @@ Verify each finding against the original task contract, fix real bugs, re-run te
     };
 
     for (const watch of watches) {
-      const task = store.task(watch.taskId);
       const ws = store.workstream(watch.workstream);
-      if (task === undefined || ws === undefined || ws.archived_at !== null || task.status === "dropped" || task.status === "done") {
+      if (ws === undefined || ws.archived_at !== null) {
         store.updateWatch(watch.id, { status: "cancelled" });
         changed = true;
         continue;
       }
+
+      const task = watch.taskId !== null ? (store.task(watch.taskId) ?? null) : null;
+      const isManagerWatch = watch.owner === "ariadne";
+
+      if (isManagerWatch) {
+        // Manager-owned watches stay active across task completion (including done/in-review
+        // or workstream-level watches with no taskId). Only cancel if a bound task was dropped/deleted.
+        if (watch.taskId !== null && (task === null || task.status === "dropped")) {
+          store.updateWatch(watch.id, { status: "cancelled" });
+          store.event("watch-cancelled", `${watch.id} bound task ${watch.taskId} dropped/missing`, ws.name, watch.taskId);
+          add(
+            ws.name,
+            `Watch ${watch.id} (${watch.kind} ${watch.target}) was cancelled because bound task ${watch.taskId} is no longer active.`,
+          );
+          changed = true;
+          continue;
+        }
+      } else if (task === null || task.status === "dropped" || task.status === "done") {
+        store.updateWatch(watch.id, { status: "cancelled" });
+        store.event(
+          "watch-cancelled",
+          `${watch.id} worker watch task ${watch.taskId ?? "-"} is ${task?.status ?? "missing"}`,
+          ws.name,
+          watch.taskId,
+        );
+        if (task !== null && task.status === "done") {
+          add(
+            ws.name,
+            `Worker watch ${watch.id} (${watch.kind} ${watch.target}) on ${task.id} (${task.title}) was cancelled because the task is already done. Re-register as a manager watch via ariadne_watch if you still need to track it.`,
+          );
+        }
+        changed = true;
+        continue;
+      }
+
+      const wsEvalCtx = {
+        ...evalCtx,
+        runCommand: async (t: Task | null, command: string) => {
+          if (t !== null) return evalCtx.runCommand(t, command);
+          const fallbackPath = (await projectSource(ws.project_id).catch(() => null))?.path ?? process.cwd();
+          return runCheckCommand(fallbackPath, command);
+        },
+      };
+
+      const label = task !== null ? `${task.id} (${task.title})` : `workstream ${ws.name}`;
       try {
-        const outcome = await evaluateWatch(watch, task, evalCtx);
+        const outcome = await evaluateWatch(watch, task, wsEvalCtx);
         if (outcome.status === "pending") {
           store.updateWatch(watch.id, { lastCheckedAt: Date.now(), lastState: outcome.state });
           continue;
         }
         if (outcome.status === "expired") {
           store.updateWatch(watch.id, { status: "expired", lastCheckedAt: Date.now(), lastState: outcome.state });
-          store.event("watch-expired", `${watch.id} ${watch.kind} ${watch.target}`, ws.name, task.id);
-          const remaining = store.watchesForTask(task.id, true);
-          if (task.status === "waiting" && remaining.length === 0) {
-            store.updateTask(task.id, { status: "blocked" });
+          store.event("watch-expired", `${watch.id} ${watch.kind} ${watch.target}`, ws.name, watch.taskId);
+          if (task !== null && !isManagerWatch) {
+            const remaining = store.watchesForTask(task.id, true);
+            if (task.status === "waiting" && remaining.length === 0) {
+              store.updateTask(task.id, { status: "blocked" });
+            }
           }
-          add(ws.name, `Watch ${watch.id} on ${task.id} (${task.title}) expired: ${outcome.detail}`);
+          add(ws.name, `Watch ${watch.id} on ${label} expired: ${outcome.detail}`);
           changed = true;
           continue;
         }
@@ -1654,13 +1836,13 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           lastState: outcome.state,
           triggeredAt: Date.now(),
         });
-        store.event("watch-triggered", `${watch.id} ${watch.kind} ${watch.target}: ${outcome.detail}`, ws.name, task.id);
+        store.event("watch-triggered", `${watch.id} ${watch.kind} ${watch.target}: ${outcome.detail}`, ws.name, watch.taskId);
         changed = true;
         const wakePrompt = `${ORCHESTRATOR_PREFIX} Watch ${watch.id} triggered (${watch.kind} ${watch.target}).\n\nObserved: ${outcome.detail}\n\nNext step: ${watch.resumePrompt}`;
-        if (task.workerThreadId !== null) {
+        if (!isManagerWatch && task !== null && task.workerThreadId !== null) {
           await steerOrRotateTask(task, wakePrompt, "continue", "orchestrator");
         } else {
-          add(ws.name, `Watch ${watch.id} triggered for ${task.id} (${task.title}): ${outcome.detail}. Next: ${watch.resumePrompt}`);
+          add(ws.name, `Watch ${watch.id} triggered for ${label}: ${outcome.detail}. Next: ${watch.resumePrompt}`);
         }
       } catch (error) {
         bb.log.warn(`watch ${watch.id} eval failed: ${String(error)}`);
@@ -1675,9 +1857,11 @@ Verify each finding against the original task contract, fix real bugs, re-run te
     if (watch === undefined) return null;
     store.updateWatch(watchId, { status: "cancelled" });
     store.event("watch-cancelled", watchId, watch.workstream, watch.taskId);
-    const task = store.task(watch.taskId);
-    if (task !== undefined && task.status === "waiting" && store.watchesForTask(task.id, true).length === 0) {
-      store.updateTask(task.id, { status: "blocked" });
+    if (watch.taskId !== null) {
+      const task = store.task(watch.taskId);
+      if (task !== undefined && task.status === "waiting" && store.watchesForTask(task.id, true).length === 0) {
+        store.updateTask(task.id, { status: "blocked" });
+      }
     }
     publish();
     kickReconciler();
@@ -1787,12 +1971,25 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         if (env === null || env.lifecycle.phase === "destroyed") continue;
         const pr = prSummary(await bb.sdk.environments.pullRequest({ environmentId }));
         const branch = await worktreeBranch(env);
-        store.updateTask(task.id, { pr, prUrl: pr?.url ?? task.prUrl, branch });
+        const nextPrUrl = pr?.url ?? task.prUrl;
+        if (
+          JSON.stringify(pr) !== JSON.stringify(task.pr) ||
+          nextPrUrl !== task.prUrl ||
+          branch !== task.branch
+        ) {
+          store.updateTask(task.id, { pr, prUrl: nextPrUrl, branch });
+        }
         if (pr === null) continue;
 
-        // Clear transient CI/conflict counters once clean.
+        // Clear transient CI/conflict counters once clean; also reset draft_green dedupe if CI restarts.
         if (pr.checks.state === "passing" && (task.reactionCounts.ci_failed ?? 0) > 0) {
           store.resetReaction(task.id, "ci_failed");
+        }
+        if (
+          (pr.checks.state === "pending" || pr.checks.state === "failing") &&
+          store.digestValue(`pr:${task.id}`) === `draft_green:${pr.number}`
+        ) {
+          store.clearDigest(`pr:${task.id}`);
         }
         if (pr.attention !== "conflicts" && pr.mergeableState !== "conflicts" && (task.reactionCounts.conflicts ?? 0) > 0) {
           store.resetReaction(task.id, "conflicts");
@@ -1804,7 +2001,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
 
         if (decision.kind === "mark-done") {
           store.updateTask(task.id, { status: "done" });
-          store.cancelWatchesForTask(task.id);
+          store.cancelWatchesForTask(task.id, "worker");
           store.event("pr-merged", `PR #${pr.number} ${pr.url}`, task.workstream, task.id);
           if (store.digestChanged(`pr:${task.id}`, `merged:${pr.number}`)) {
             add(task.workstream, `PR #${pr.number} for ${task.id} (${task.title}) merged: ${pr.url}`);
@@ -1845,10 +2042,12 @@ Verify each finding against the original task contract, fix real bugs, re-run te
 
         if (decision.kind === "escalate") {
           if (store.digestChanged(`pr:${task.id}`, decision.signature)) {
-            add(
-              task.workstream,
-              `${task.id} (${task.title}): ${decision.reason} If this reflects a repeatable pattern, consider updating bb memory, AGENTS.md, or recommending a workflow change.`,
-            );
+            const isPositive =
+              decision.signature.startsWith("ready_to_merge:") || decision.signature.startsWith("draft_green:");
+            const suffix = isPositive
+              ? ""
+              : " If this reflects a repeatable pattern, consider updating bb memory, AGENTS.md, or recommending a workflow change.";
+            add(task.workstream, `${task.id} (${task.title}): ${decision.reason}${suffix}`);
           }
         }
       } catch (error) {
@@ -1876,6 +2075,107 @@ Verify each finding against the original task contract, fix real bugs, re-run te
     }
   }
 
+  async function retryFailedManagers() {
+    const now = Date.now();
+    for (const [threadId, entry] of [...pendingManagerRetries.entries()]) {
+      if (now < entry.retryAt) continue;
+      const ws = store.workstream(entry.workstream);
+      if (ws === undefined || ws.archived_at !== null) {
+        pendingManagerRetries.delete(threadId);
+        continue;
+      }
+      const thread = await bb.sdk.threads.get({ threadId }).catch(() => null);
+      if (thread === null || thread.archivedAt !== null || thread.deletedAt !== null) {
+        pendingManagerRetries.delete(threadId);
+        continue;
+      }
+      if (thread.status === "active" || thread.status === "starting") {
+        pendingManagerRetries.delete(threadId);
+        continue;
+      }
+      entry.retryAt = Number.POSITIVE_INFINITY;
+      store.event("manager-retried", `attempt ${entry.attempt}/${MAX_MANAGER_RETRIES}`, ws.name);
+      await tellAriadne(
+        threadId,
+        `${PLUGIN_PREFIX} Automatic recovery after a transient turn failure (${entry.error.slice(0, 200)}). Check ariadne_board and complete any pending work or user handoff.`,
+      );
+      markActivity();
+    }
+  }
+
+  let nextSettledWakeAt: number | null = null;
+
+  async function checkSettledWorkstreams(digest: Map<string, string[]>) {
+    nextSettledWakeAt = null;
+    const now = Date.now();
+    const add = (workstream: string, line: string) => digest.set(workstream, [...(digest.get(workstream) ?? []), line]);
+
+    for (const ws of store.workstreams().filter((w) => w.archived_at === null)) {
+      const tasks = store.tasks(ws.name);
+      const activeWatches = store.activeWatches(ws.name);
+      const inFlightTasks = tasks.filter(
+        (t) => t.status === "queued" || t.status === "running" || t.status === "verifying" || t.status === "waiting",
+      );
+      const inflightKey = `inflight:${ws.name}`;
+
+      if (inFlightTasks.length > 0 || activeWatches.length > 0) {
+        store.digestChanged(inflightKey, "busy");
+        continue;
+      }
+
+      if (tasks.length === 0) continue;
+      const prev = store.digestValue(inflightKey);
+      if (prev === null || prev.startsWith("settled:")) continue;
+
+      // If this tick is already waking Ariadne for this workstream (e.g. final PR merge or
+      // watch trigger), fold the settled wrap-up prompt into the same turn.
+      if ((digest.get(ws.name)?.length ?? 0) > 0) {
+        store.digestChanged(inflightKey, `settled:${now}`);
+        add(
+          ws.name,
+          "All active tasks and watches in this workstream have now finished (0 running/verifying/queued/watching). Include a concise wrap-up with current status and clear next options for the user.",
+        );
+        continue;
+      }
+
+      let settledAt: number;
+      if (prev === "busy") {
+        settledAt = now;
+        store.digestChanged(inflightKey, `settling:${settledAt}`);
+      } else if (prev.startsWith("settling:")) {
+        const parsed = Number(prev.slice("settling:".length));
+        settledAt = Number.isFinite(parsed) ? parsed : now;
+      } else {
+        continue;
+      }
+
+      const lastReplyRaw = store.digestValue(`mgr-reply:${ws.name}`);
+      const lastReplyAt = lastReplyRaw !== null ? Number(lastReplyRaw) : 0;
+      if (Number.isFinite(lastReplyAt) && lastReplyAt >= settledAt) {
+        store.digestChanged(inflightKey, `settled:${settledAt}`);
+        continue;
+      }
+
+      // Wait briefly so BB's batched child-completed turn can start and reply before we intervene.
+      const remainingGrace = SETTLED_GRACE_MS - (now - settledAt);
+      if (remainingGrace > 0) {
+        const targetAt = settledAt + SETTLED_GRACE_MS;
+        if (nextSettledWakeAt === null || targetAt < nextSettledWakeAt) nextSettledWakeAt = targetAt;
+        continue;
+      }
+
+      const thread = await bb.sdk.threads.get({ threadId: ws.ariadne_thread_id }).catch(() => null);
+      if (thread === null || thread.status !== "idle") continue;
+
+      store.digestChanged(inflightKey, `settled:${settledAt}`);
+      store.event("workstream-settled", `0 active tasks/watches (${tasks.length} total)`, ws.name);
+      add(
+        ws.name,
+        "Workstream settled: all active tasks and watches have now finished (0 running, verifying, queued, or waiting). Give the user a concise status wrap-up (including PR/CI state) and clear next options or what you are waiting on from them.",
+      );
+    }
+  }
+
   let activeReconcile: Promise<void> | null = null;
   let pendingReconcile = false;
 
@@ -1890,6 +2190,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         await archiveOrphanedWorkstreams();
         await syncWorkstreamChildren();
         await reconcileOrphanedVerifiers();
+        await retryFailedManagers();
 
         const digest = new Map<string, string[]>();
         const add = (workstream: string, line: string) => digest.set(workstream, [...(digest.get(workstream) ?? []), line]);
@@ -1927,6 +2228,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           }
         }
 
+        await checkSettledWorkstreams(digest);
         await compactHeavyManagers();
 
         for (const [workstream, lines] of digest) {
@@ -1945,6 +2247,20 @@ Verify each finding against the original task contract, fix real bugs, re-run te
       }
     })();
     return activeReconcile;
+  }
+
+  function nextReconcileSleepMs(): number {
+    let sleepMs = Math.max(10, Math.round(config.reconcileSeconds)) * 1000;
+    const now = Date.now();
+    for (const entry of pendingManagerRetries.values()) {
+      if (Number.isFinite(entry.retryAt)) {
+        sleepMs = Math.min(sleepMs, Math.max(250, entry.retryAt - now));
+      }
+    }
+    if (nextSettledWakeAt !== null) {
+      sleepMs = Math.min(sleepMs, Math.max(250, nextSettledWakeAt - now));
+    }
+    return sleepMs;
   }
 
   bb.background.service("reconciler", {
@@ -1978,8 +2294,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           } catch (error) {
             bb.log.warn(`reconciler tick failed: ${String(error)}`);
           }
-          const intervalMs = Math.max(10, Math.round(config.reconcileSeconds)) * 1000;
-          await sleepOrWake(intervalMs, signal);
+          await sleepOrWake(nextReconcileSleepMs(), signal);
         }
       } finally {
         unsubscribe?.();
@@ -2038,6 +2353,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           "ariadne_adopt_worker",
           "ariadne_detach_worker",
           "ariadne_drop_task",
+          "ariadne_delete_thread",
           "ariadne_notes_read",
           "ariadne_notes_write",
           "ariadne_staging",
@@ -2145,15 +2461,21 @@ Verify each finding against the original task contract, fix real bugs, re-run te
       const ws = await requireAriadne(threadId);
       if (typeof ws === "string") return errorText(ws);
       const tasks = store.tasks(ws.name, status);
-      if (tasks.length === 0) return "No tasks.";
-      return tasks
-        .map((t) =>
-          boardRow(t, true, {
-            watches: store.watchesForTask(t.id, true),
-            runs: store.runsForTask(t.id),
-          }),
-        )
-        .join("\n");
+      const wsWatches = status === undefined ? store.activeWatches(ws.name).filter((w) => w.taskId === null) : [];
+      if (tasks.length === 0 && wsWatches.length === 0) return "No tasks.";
+      const lines = tasks.map((t) =>
+        boardRow(t, true, {
+          watches: store.watchesForTask(t.id, true),
+          runs: store.runsForTask(t.id),
+        }),
+      );
+      if (wsWatches.length > 0) {
+        lines.push(
+          "Workstream watches:",
+          ...wsWatches.map((w) => `  ${w.id} [${w.owner}] ${w.kind} ${w.target}${w.lastState ? ` (${w.lastState})` : ""}`),
+        );
+      }
+      return lines.join("\n");
     },
   });
 
@@ -2544,6 +2866,28 @@ Verify each finding against the original task contract, fix real bugs, re-run te
   });
 
   bb.agents.registerTool({
+    name: "ariadne_delete_thread",
+    description:
+      "Delete a completed or no-longer-needed worker/child thread belonging to this workstream while preserving completed task records on the board. Checks for active turns and uncommitted/unpushed git work unless force=true.",
+    presentation: { label: { pending: "Deleting thread", completed: "Deleted thread" } },
+    parameters: z.object({
+      threadId: z.string().optional().describe("Thread ID of a worker or child thread in this workstream"),
+      taskId: z.string().optional().describe("Task ID whose worker thread should be deleted (keeps task history on the board)"),
+      reason: z.string().max(300).optional().describe("Short reason for removing the thread"),
+      force: z.boolean().optional().describe("Set true to delete even if still active or worktree has unpushed/uncommitted work"),
+    }),
+    async execute(args, { threadId }) {
+      const ws = await requireAriadne(threadId);
+      if (typeof ws === "string") return errorText(ws);
+      try {
+        return await deleteManagedThread(ws, args);
+      } catch (error) {
+        return errorText(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
     name: "ariadne_inspect",
     description:
       "Inspect a task's live facts: worker status, context tokens, last output, diff files, run history, active watches and PR status.",
@@ -2642,7 +2986,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
   bb.agents.registerTool({
     name: "ariadne_watch",
     description:
-      "Register a durable zero-token watch (pr-merged, pr-checks, task-done, timer, or command). Workers: call this and end your turn instead of bash polling loops.",
+      "Register a durable zero-token watch (pr-merged, pr-checks, task-done, timer, or command). Manager watches default to waking Ariadne and work with or without taskId (even on done/in-review tasks). Workers: call this and end your turn instead of bash polling loops.",
     presentation: { label: { pending: "Registering watch", completed: "Registered watch" } },
     parameters: z.object({
       kind: z.enum(WATCH_KINDS),
@@ -2651,28 +2995,50 @@ Verify each finding against the original task contract, fix real bugs, re-run te
         .min(1)
         .max(500)
         .describe(
-          "For pr-merged/pr-checks: 'self', PR URL, or 'owner/repo#123'. For task-done: taskId. For timer: duration like '30m'/'2h' or ISO timestamp. For command: shell command exiting 0 when ready.",
+          "For pr-merged/pr-checks: 'self' (requires taskId), PR URL, or 'owner/repo#123'. For task-done: taskId. For timer: duration like '30m'/'2h' or ISO timestamp. For command: shell command exiting 0 when ready.",
         ),
       resumePrompt: z.string().min(1).max(2000).describe("What to do when the watch triggers"),
       expiresInHours: z.number().min(0.1).max(168).optional().describe("Expiry timeout in hours (default 24)"),
-      taskId: z.string().optional().describe("Required when called from Ariadne; inferred automatically for workers"),
+      taskId: z.string().optional().describe("Optional for Ariadne (omit for a workstream-level watch); inferred automatically for workers"),
+      wake: z.enum(WATCH_OWNERS).optional().describe("For Ariadne only: 'ariadne' (default, wakes manager) or 'worker' (wakes taskId's worker)"),
     }),
-    async execute({ kind, target, resumePrompt, expiresInHours, taskId: explicitTaskId }, { threadId }) {
+    async execute({ kind, target, resumePrompt, expiresInHours, taskId: explicitTaskId, wake }, { threadId }) {
       const asAriadne = store.workstreamByAriadne(threadId);
-      let task: Task | undefined;
+      let workstreamName: string;
+      let task: Task | null = null;
+      let owner: WatchOwner = "worker";
       let calledByWorker = false;
+
       if (asAriadne !== undefined && asAriadne.archived_at === null) {
-        if (!explicitTaskId) return errorText("Ariadne must pass taskId to ariadne_watch.");
-        task = store.task(explicitTaskId);
-        if (task === undefined || task.workstream !== asAriadne.name) {
-          return errorText(`No task ${explicitTaskId} in this workstream.`);
+        workstreamName = asAriadne.name;
+        owner = wake ?? "ariadne";
+        if (explicitTaskId) {
+          const found = store.task(explicitTaskId);
+          if (found === undefined || found.workstream !== asAriadne.name) {
+            return errorText(`No task ${explicitTaskId} in this workstream.`);
+          }
+          task = found;
+        }
+        if (owner === "worker") {
+          if (task === null) return errorText("wake='worker' requires taskId.");
+          if (task.status === "done" || task.status === "dropped") {
+            return errorText(
+              `Cannot register a worker watch on ${task.status} task ${task.id}; omit wake (defaults to waking Ariadne) or reopen the task.`,
+            );
+          }
         }
       } else {
-        task = store.activeTaskByWorker(threadId);
-        if (task === undefined) return errorText("Only an Ariadne manager or active worker can register a watch.");
+        const found = store.activeTaskByWorker(threadId);
+        if (found === undefined) return errorText("Only an Ariadne manager or active worker can register a watch.");
+        workstreamName = found.workstream;
+        task = found;
+        owner = "worker";
         calledByWorker = true;
       }
 
+      if ((kind === "pr-merged" || kind === "pr-checks") && target === "self" && task === null) {
+        return errorText("target='self' requires taskId; otherwise pass a PR URL or 'owner/repo#number'.");
+      }
       if ((kind === "pr-merged" || kind === "pr-checks") && target !== "self" && parsePrTarget(target) === null) {
         return errorText(`Invalid PR target ${JSON.stringify(target)}. Use 'self', a GitHub PR URL, or 'owner/repo#number'.`);
       }
@@ -2688,24 +3054,29 @@ Verify each finding against the original task contract, fix real bugs, re-run te
 
       const expiresAt = Date.now() + (expiresInHours ?? 24) * 3_600_000;
       const watch = store.insertWatch({
-        workstream: task.workstream,
-        taskId: task.id,
+        workstream: workstreamName,
+        taskId: task?.id ?? null,
+        owner,
         kind: kind as WatchKind,
         target: normalizedTarget,
         resumePrompt,
         expiresAt,
       });
-      if (calledByWorker) {
+      if (calledByWorker && task !== null) {
         store.updateTask(task.id, { status: "waiting" });
         workerTurns.reported(threadId);
+      } else if (owner === "worker" && task !== null && task.status === "running") {
+        store.updateTask(task.id, { status: "waiting" });
       }
-      store.event("watch-created", `${watch.id} ${kind} ${normalizedTarget}`, task.workstream, task.id);
+      store.digestChanged(`inflight:${workstreamName}`, "busy");
+      store.event("watch-created", `${watch.id} [${owner}] ${kind} ${normalizedTarget}`, workstreamName, task?.id ?? null);
       markActivity();
       publish();
       kickReconciler();
-      return calledByWorker
-        ? `Watch ${watch.id} registered (${kind} ${normalizedTarget}). Task ${task.id} moved to waiting. End your turn now; the orchestrator will wake you when it triggers.`
-        : `Watch ${watch.id} registered on ${task.id} (${kind} ${normalizedTarget}).`;
+      if (calledByWorker && task !== null) {
+        return `Watch ${watch.id} registered (${kind} ${normalizedTarget}). Task ${task.id} moved to waiting. End your turn now; the orchestrator will wake you when it triggers.`;
+      }
+      return `Watch ${watch.id} registered (${kind} ${normalizedTarget}, wakes ${owner}${task !== null ? `, task ${task.id}` : ", workstream-level"}).`;
     },
   });
 
@@ -3078,6 +3449,7 @@ Verify each finding against the original task contract, fix real bugs, re-run te
 
   async function onThreadRetired({ thread }: { thread: { id: string; originPluginId: string | null } }) {
     pendingSessionActions.delete(thread.id);
+    pendingManagerRetries.delete(thread.id);
     const ws = store.workstreamByAriadne(thread.id);
     if (ws !== undefined) {
       store.archiveWorkstream(ws.name);
@@ -3149,9 +3521,13 @@ Verify each finding against the original task contract, fix real bugs, re-run te
       return;
     }
 
-    // Manager thread went idle -> check if auto-compaction is due.
+    // Manager thread went idle -> clear transient retry state, record visible user replies, and reconcile.
     const asAriadne = store.workstreamByAriadne(thread.id);
     if (asAriadne !== undefined && asAriadne.archived_at === null) {
+      pendingManagerRetries.delete(thread.id);
+      if ((lastAssistantText ?? "").trim() !== "") {
+        store.digestChanged(`mgr-reply:${asAriadne.name}`, String(Date.now()));
+      }
       kickReconciler();
       return;
     }
@@ -3185,6 +3561,33 @@ Verify each finding against the original task contract, fix real bugs, re-run te
   bb.events.on("thread.failed", async ({ thread, error }) => {
     if (!isManagedThread(thread.id)) return;
     markActivity();
+
+    const asAriadne = store.workstreamByAriadne(thread.id);
+    if (asAriadne !== undefined && asAriadne.archived_at === null) {
+      const errText = error ?? "unknown error";
+      store.event("manager-failed", errText, asAriadne.name);
+      const prevAttempt = pendingManagerRetries.get(thread.id)?.attempt ?? 0;
+      if (isTransientProviderError(errText) && prevAttempt < MAX_MANAGER_RETRIES) {
+        const attempt = prevAttempt + 1;
+        const delayMs = attempt === 1 ? 30_000 : 90_000;
+        pendingManagerRetries.set(thread.id, {
+          workstream: asAriadne.name,
+          attempt,
+          retryAt: Date.now() + delayMs,
+          error: errText,
+        });
+        store.event(
+          "manager-retry-scheduled",
+          `attempt ${attempt}/${MAX_MANAGER_RETRIES} in ${Math.round(delayMs / 1000)}s: ${errText}`,
+          asAriadne.name,
+        );
+        kickReconciler();
+      } else {
+        pendingManagerRetries.delete(thread.id);
+        store.event("manager-retry-exhausted", errText, asAriadne.name);
+      }
+      return;
+    }
 
     const run = store.runByThread(thread.id);
     if (run !== undefined && run.role === "verifier") {
@@ -3246,7 +3649,10 @@ Verify each finding against the original task contract, fix real bugs, re-run te
       store.event("manager-compacted", `${ws.ariadne_thread_id} (manual)`, name);
       return { ok: true, detail: `Requested compaction for ${name}.` };
     },
-    board: async ({ workstream }) => ({ tasks: boardTasks(workstream) }),
+    board: async ({ workstream }) => ({
+      tasks: boardTasks(workstream),
+      watches: store.activeWatches(workstream).filter((w) => w.taskId === null),
+    }),
     task_drop_preview: async ({ taskId }) => {
       const task = store.task(taskId);
       return { risk: task === undefined ? null : await workAtRisk(task) };
@@ -3488,7 +3894,8 @@ Verify each finding against the original task contract, fix real bugs, re-run te
           async run(input) {
             const watches: Watch[] = store.activeWatches(input.positionals.workstream || undefined);
             const lines = watches.map(
-              (w) => `${w.id}  ${w.workstream}/${w.taskId}  ${w.kind}  ${w.target}  state=${w.lastState ?? "pending"}`,
+              (w) =>
+                `${w.id}  ${w.workstream}${w.taskId ? `/${w.taskId}` : ""} [${w.owner}]  ${w.kind}  ${w.target}  state=${w.lastState ?? "pending"}`,
             );
             return { exitCode: 0, stdout: lines.length === 0 ? "No active watches." : lines.join("\n") };
           },

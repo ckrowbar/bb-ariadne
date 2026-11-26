@@ -11,6 +11,7 @@ import {
   TASK_STATUSES,
   VERIFY_MODES,
   WATCH_KINDS,
+  WATCH_OWNERS,
   WATCH_STATUSES,
 } from "./constants.ts";
 
@@ -25,6 +26,7 @@ export {
   TASK_STATUSES,
   VERIFY_MODES,
   WATCH_KINDS,
+  WATCH_OWNERS,
   WATCH_STATUSES,
   type DependsMode,
   type ReasoningLevel,
@@ -35,6 +37,7 @@ export {
   type TaskStatus,
   type VerifyMode,
   type WatchKind,
+  type WatchOwner,
   type WatchStatus,
 } from "./constants.ts";
 
@@ -89,7 +92,8 @@ export type TaskRun = z.infer<typeof taskRunSchema>;
 export const watchSchema = z.object({
   id: z.string(),
   workstream: z.string(),
-  taskId: z.string(),
+  taskId: z.string().nullable(),
+  owner: z.enum(WATCH_OWNERS),
   kind: z.enum(WATCH_KINDS),
   target: z.string(),
   resumePrompt: z.string(),
@@ -236,7 +240,7 @@ export const rpcContract = defineRpcContract({
   },
   board: {
     input: z.object({ workstream: z.string() }),
-    output: z.object({ tasks: z.array(boardTaskSchema) }),
+    output: z.object({ tasks: z.array(boardTaskSchema), watches: z.array(watchSchema) }),
   },
   task_drop_preview: {
     input: z.object({ taskId: z.string() }),

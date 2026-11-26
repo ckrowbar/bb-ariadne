@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { PrSummary } from "./contract.ts";
-import { decidePrReaction, shouldCompactManager, shouldRotateWorker, shouldRunVerifier } from "./reactions.ts";
+import {
+  decidePrReaction,
+  isTransientProviderError,
+  shouldCompactManager,
+  shouldRotateWorker,
+  shouldRunVerifier,
+} from "./reactions.ts";
 
 const defaultPolicy = {
   autoReactCi: true,
@@ -63,6 +69,38 @@ test("decidePrReaction handles conflicts, changes_requested policy, ready_to_mer
   const mergedPr = makePr({ state: "merged", attention: "merged" });
   assert.equal(decidePrReaction({ status: "in-review", reactionCounts: {} }, mergedPr, false, defaultPolicy).kind, "mark-done");
   assert.equal(decidePrReaction({ status: "done", reactionCounts: {} }, mergedPr, false, defaultPolicy).kind, "none");
+
+  // Draft PR stays quiet while checks are pending or absent, and escalates once checks pass.
+  const draftPending = makePr({
+    attention: "draft",
+    checks: { state: "pending", passed: 1, failed: 0, pending: 2 },
+  });
+  assert.equal(decidePrReaction({ status: "in-review", reactionCounts: {} }, draftPending, false, defaultPolicy).kind, "none");
+
+  const draftNoChecks = makePr({
+    attention: "draft",
+    checks: { state: "passing", passed: 0, failed: 0, pending: 0 },
+  });
+  assert.equal(decidePrReaction({ status: "in-review", reactionCounts: {} }, draftNoChecks, false, defaultPolicy).kind, "none");
+
+  const draftGreen = makePr({
+    attention: "draft",
+    checks: { state: "passing", passed: 4, failed: 0, pending: 0 },
+  });
+  const greenDecision = decidePrReaction({ status: "in-review", reactionCounts: {} }, draftGreen, false, defaultPolicy);
+  assert.equal(greenDecision.kind, "escalate");
+  if (greenDecision.kind === "escalate") {
+    assert.equal(greenDecision.signature, "draft_green:42");
+  }
+});
+
+test("isTransientProviderError distinguishes temporary gateway/network errors from permanent ones", () => {
+  assert.equal(isTransientProviderError("API Error: 503 AI Gateway requires a foreground login. This is temporary."), true);
+  assert.equal(isTransientProviderError("429 Too Many Requests"), true);
+  assert.equal(isTransientProviderError("ECONNRESET socket hang up"), true);
+  assert.equal(isTransientProviderError("Invalid parameter: unknown model foo"), false);
+  assert.equal(isTransientProviderError(""), false);
+  assert.equal(isTransientProviderError(undefined), false);
 });
 
 test("context rotation, manager compaction and verifier gating rules", () => {
